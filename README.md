@@ -1,10 +1,10 @@
-# fattureincloud-mcp
+# fattureincloud-mcp-vasario
 
-[![PyPI](https://img.shields.io/pypi/v/fattureincloud-mcp)](https://pypi.org/project/fattureincloud-mcp/)
+> Fork di [aringad/fattureincloud-mcp](https://github.com/aringad/fattureincloud-mcp) (MIT License, copyright originale Mediaform s.c.r.l.), con estensioni per l'uso quotidiano dello studio Vasario: `mark_as_paid` e cache dei conti di pagamento / tipi IVA.
+
+[![PyPI (upstream)](https://img.shields.io/pypi/v/fattureincloud-mcp)](https://pypi.org/project/fattureincloud-mcp/)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![MCPB](https://img.shields.io/badge/MCPB-compatible-blue)](https://github.com/modelcontextprotocol/mcpb)
-
-<!-- mcp-name: io.github.aringad/fattureincloud-mcp -->
 
 MCP server that connects Claude (Desktop, Code, or any MCP client) to **FattureInCloud**, the leading Italian SaaS for electronic invoicing. Manage invoices, credit notes, proformas, clients, suppliers, cost/revenue centers, and supplier expenses through natural language. Italy mandates B2B/B2C e-invoicing through the Sistema di Interscambio (SDI) — this server brings AI-assisted billing to that compliance-driven workflow.
 
@@ -38,7 +38,9 @@ MCP server that connects Claude (Desktop, Code, or any MCP client) to **FattureI
 | `get_situation` | Yearly dashboard: net revenue, collected, outstanding, costs, margin |
 | `check_numeration` | Verify invoice numbering continuity |
 
-> Marking payments as "paid" is intentionally not exposed: the FattureInCloud API requires a payment account that cannot be reliably retrieved through the SDK. Use the FattureInCloud web panel for that operation.
+> **Fork note:** the payment account limitation described above is resolved in this fork — `list_payment_accounts` reliably returns all configured accounts, and `mark_as_paid` uses it to mark an invoice as paid (payment account + date). See [`mark_as_paid` in server.py](server.py).
+>
+> **Known issue:** `mark_as_paid` currently fails with `409 "document is locked. Cannot edit items_list core data"` on e-invoices already transmitted to SdI, because the underlying request includes `items_list` unconditionally. A fix (partial update touching only `payments_list`) is planned but not yet implemented — see [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md).
 
 ## Installation
 
