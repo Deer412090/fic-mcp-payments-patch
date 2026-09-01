@@ -40,7 +40,7 @@ MCP server that connects Claude (Desktop, Code, or any MCP client) to **FattureI
 
 > **Fork note:** the payment account limitation described above is resolved in this fork — `list_payment_accounts` reliably returns all configured accounts, and `mark_as_paid` uses it to mark an invoice as paid (payment account + date). See [`mark_as_paid` in server.py](server.py).
 >
-> **Known issue:** `mark_as_paid` currently fails with `409 "document is locked. Cannot edit items_list core data"` on e-invoices already transmitted to SdI, because the underlying request includes `items_list` unconditionally. A fix (partial update touching only `payments_list`) is planned but not yet implemented — see [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md).
+> `mark_as_paid` works on **both** already-transmitted e-invoices and non-electronic documents. It issues a partial update touching only `payments_list`, and reads the amount due from the document instead of recomputing it, so line items, per-line tax flags, cassa, withholding tax and stamp duty are all left untouched. Invoices split into multiple instalments are refused explicitly rather than collapsed into a single payment. See [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) for the three bugs this replaced and for how the partial-PUT behaviour was verified.
 
 ## Installation
 
