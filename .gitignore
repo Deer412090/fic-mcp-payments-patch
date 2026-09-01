@@ -38,5 +38,5 @@ lib/
 # Materiale operativo personale — non fa parte del progetto software
 .claude/
 CLAUDE.md
-Regole_fatturazione_Vasario.md
+Regole_fatturazione_*.md
 MIGRAZIONE_CLAUDE_CODE.md
