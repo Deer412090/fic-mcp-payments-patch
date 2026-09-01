@@ -249,7 +249,7 @@ def build_issued_document(doc_type, client_id, items_data, date_str, payment_day
 
     # Calcolo ritenuta e pagamento
     if not disable_withholding_tax and withholding_rate_pct > 0:
-        # Base imponibile ritenuta: esclude bollo (art.15) salvo eccezione Cidimu
+        # Base imponibile ritenuta: esclude bollo (art.15) salvo clienti che richiedono ritenuta anche sul bollo
         if withholding_on_bollo:
             withholding_base = total_abs
         else:
@@ -453,7 +453,7 @@ async def list_tools():
             name="create_invoice",
             description=(
                 "Crea fattura. "
-                "Per pazienti privati (serie F, no SdI — Fornaca, Cellini, studio): usa electronic=false e finalize=true. "
+                "Per pazienti privati (serie F, no SdI): usa electronic=false e finalize=true. "
                 "Questo sostituisce l'intero percorso proforma→converti→finalizza in un'unica chiamata. "
                 "Per B2B con SdI: electronic=true (default), poi usa send_to_sdi. "
                 "IMPORTANTE: Chiedere sempre conferma all'utente prima di eseguire."
@@ -471,7 +471,7 @@ async def list_tools():
                     "disable_withholding_tax": {"type": "boolean", "description": "Disabilita ritenuta d'acconto (default false). True per pazienti privati."},
                     "electronic": {"type": "boolean", "description": "Fattura elettronica SdI (default: true). False per pazienti privati (serie F, no SdI)."},
                     "finalize": {"type": "boolean", "description": "Finalizza subito (locked=True, non modificabile). True per pazienti privati. Default: false."},
-                    "withholding_on_bollo": {"type": "boolean", "description": "Applica ritenuta anche sulla marca da bollo (default: false). True solo per Cidimu."},
+                    "withholding_on_bollo": {"type": "boolean", "description": "Applica ritenuta anche sulla marca da bollo (default: false). True solo se il cliente lo richiede esplicitamente."},
                     "number": {"type": "integer", "description": "Numero fattura (opzionale). Usare solo per la PRIMA fattura di un nuovo sezionale, es. 137 per avviare la serie FE da FE137/2026."},
                     "numeration": {"type": "string", "description": "Sezionale (opzionale). Es. 'FE' per fatture elettroniche B2B. Dopo la prima, FIC auto-incrementa."}
                 },
@@ -494,7 +494,7 @@ async def list_tools():
                     "revenue_center": {"type": "string", "description": "Centro di ricavo (opzionale, deve esistere — vedi list_cost_centers)"},
                     "disable_cassa": {"type": "boolean", "description": "Disabilita cassa previdenziale (default false)."},
                     "disable_withholding_tax": {"type": "boolean", "description": "Disabilita ritenuta d'acconto (default false)."},
-                    "withholding_on_bollo": {"type": "boolean", "description": "Applica ritenuta anche sulla marca da bollo (default: false). True per Cidimu e CDC — deve rispecchiare il trattamento della fattura originale che si sta stornando."},
+                    "withholding_on_bollo": {"type": "boolean", "description": "Applica ritenuta anche sulla marca da bollo (default: false). Deve rispecchiare il trattamento della fattura originale che si sta stornando."},
                     "electronic": {"type": "boolean", "description": "Nota di credito elettronica SdI (default: true). False per pazienti privati (serie F)."}
                 },
                 "required": ["client_id", "items"]

@@ -1,6 +1,6 @@
-# fattureincloud-mcp-vasario
+# fic-mcp-payments-patch
 
-> Fork di [aringad/fattureincloud-mcp](https://github.com/aringad/fattureincloud-mcp) (MIT License, copyright originale Mediaform s.c.r.l.), con estensioni per l'uso quotidiano dello studio Vasario: `mark_as_paid` e cache dei conti di pagamento / tipi IVA.
+> Fork di [aringad/fattureincloud-mcp](https://github.com/aringad/fattureincloud-mcp) (MIT License, copyright originale Mediaform s.c.r.l.), con due estensioni: `mark_as_paid` e cache dei conti di pagamento / tipi IVA. Utile a chiunque usi questo MCP server e si trovi nella stessa condizione: serve marcare fatture come pagate via API senza passare dal pannello web.
 
 [![PyPI (upstream)](https://img.shields.io/pypi/v/fattureincloud-mcp)](https://pypi.org/project/fattureincloud-mcp/)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
