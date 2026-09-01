@@ -1702,39 +1702,86 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     }
                 })
 
-            # Costruisci pagamento come incassato
-            orig_payments = orig.get("payments_list", [{}])
-            payment_days = orig_payments[0].get("payment_terms", {}).get("days", 0) if orig_payments else 0
-            total = sum(abs(i["qty"] * i["net_price"]) for i in items_list)
+            # Costruisci pagamento come incassato.
+            #
+            # L'importo NON si ricalcola dalle righe: FattureInCloud ha gia'
+            # scritto in payments_list il dovuto reale, gia' comprensivo del
+            # bollo di documento (`stamp_duty`) e gia' al netto della ritenuta
+            # d'acconto. Ricalcolarlo dalle sole righe sbagliava in due modi:
+            #   - bollo nel campo `stamp_duty` invece che come riga -> -2 EUR
+            #   - ritenuta d'acconto -> +20% (es. 335,00 invece di 268,00)
+            # In entrambi i casi l'API rispondeva 422 "Il totale dei pagamenti
+            # non corrisponde al totale da pagare".
+            orig_payments = orig.get("payments_list") or []
+            if len(orig_payments) > 1:
+                return [TextContent(type="text", text=json.dumps({
+                    "success": False,
+                    "error": "piano_a_rate",
+                    "document_id": doc_id,
+                    "rate": len(orig_payments),
+                    "message": (
+                        f"La fattura ha {len(orig_payments)} scadenze: marcarla "
+                        "come pagata da qui collasserebbe il piano di pagamento "
+                        "in un'unica rata. Intervenire dal gestionale."
+                    ),
+                }, indent=2, ensure_ascii=False))]
+
+            orig_payment = orig_payments[0] if orig_payments else {}
+            orig_terms = orig_payment.get("payment_terms") or {}
+
+            if orig_payment.get("amount") is not None:
+                total = float(orig_payment["amount"])
+            else:
+                # Nessuna scadenza registrata: ricostruisci il dovuto dalle
+                # righe, aggiungendo il bollo se e' a livello documento.
+                total = sum(abs(i["qty"] * i["net_price"]) for i in items_list)
+                total += float(orig.get("stamp_duty") or 0)
 
             payment = {
                 "amount": round(total, 2),
-                "due_date": paid_date,
+                "due_date": str(orig_payment.get("due_date") or paid_date)[:10],
                 "paid_date": paid_date,
                 "status": "paid",
-                "payment_terms": {"days": payment_days, "type": "standard"}
+                "payment_terms": {
+                    "days": orig_terms.get("days", 0),
+                    "type": orig_terms.get("type") or "standard",
+                }
             }
             if payment_account_id:
                 payment["payment_account"] = {"id": payment_account_id}
+            elif orig_payment.get("payment_account"):
+                payment["payment_account"] = {
+                    "id": orig_payment["payment_account"].get("id")
+                }
 
-            body_data = {
-                "type": doc_type,
-                "entity": entity,
-                "date": date_str[:10],
-                "visible_subject": visible_subject,
-                "items_list": items_list,
-                "payments_list": [payment]
-            }
-            if doc_type in ("invoice", "credit_note") and orig.get("e_invoice"):
-                body_data["e_invoice"] = orig.get("e_invoice", False)
-                if orig.get("ei_data"):
-                    body_data["ei_data"] = orig["ei_data"]
-            # Preserva cassa e ritenuta
-            for field in ["cassa", "cassa_taxable", "withholding_tax", "withholding_tax_taxable"]:
-                if orig.get(field) is not None:
-                    body_data[field] = orig[field]
-            if orig.get("rc_center"):
-                body_data["rc_center"] = orig["rc_center"]
+            locked = bool(orig.get("ei_status"))
+            if locked:
+                # Documento gia' trasmesso a SdI: `items_list` e' bloccato e un
+                # PUT che lo includa risponde 409 "The document is locked.
+                # Cannot edit items_list core data". `items_list` e
+                # `payments_list` sono entrambi opzionali nell'SDK e i campi
+                # None non vengono serializzati: il PUT parziale tocca solo
+                # payments_list e lascia intatto il resto del documento.
+                body_data = {"payments_list": [payment]}
+            else:
+                body_data = {
+                    "type": doc_type,
+                    "entity": entity,
+                    "date": date_str[:10],
+                    "visible_subject": visible_subject,
+                    "items_list": items_list,
+                    "payments_list": [payment]
+                }
+                if doc_type in ("invoice", "credit_note") and orig.get("e_invoice"):
+                    body_data["e_invoice"] = orig.get("e_invoice", False)
+                    if orig.get("ei_data"):
+                        body_data["ei_data"] = orig["ei_data"]
+                # Preserva cassa e ritenuta
+                for field in ["cassa", "cassa_taxable", "withholding_tax", "withholding_tax_taxable"]:
+                    if orig.get(field) is not None:
+                        body_data[field] = orig[field]
+                if orig.get("rc_center"):
+                    body_data["rc_center"] = orig["rc_center"]
 
             response = issued_api.modify_issued_document(
                 company_id=COMPANY_ID,
@@ -1753,6 +1800,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             }
             if payment_account_id:
                 result["payment_account_id"] = payment_account_id
+            if locked:
+                result["mode"] = "put_parziale_documento_trasmesso"
             return [TextContent(type="text", text=json.dumps(result, indent=2, ensure_ascii=False))]
 
         elif name == "list_cost_centers":
