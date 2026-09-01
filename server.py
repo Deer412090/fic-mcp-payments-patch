@@ -97,6 +97,16 @@ def get_ei_code_for_client(client_id, *, company_id=None):
         return '0000000'
 
 
+@cache.cached("payment_accounts", ttl=timedelta(hours=24))
+def fetch_payment_accounts(*, company_id):
+    """Conti di pagamento FIC. Usato per mark_as_paid."""
+    try:
+        response = info_api.list_payment_accounts(company_id=company_id)
+        return [a.to_dict() for a in (response.data or [])]
+    except Exception:
+        return []
+
+
 @cache.cached("cost_centers", ttl=timedelta(hours=24))
 def fetch_cost_centers(*, company_id):
     """Cost centers (FIC `/info/cost_centers`). Used to validate `cost_center`
@@ -123,6 +133,39 @@ def fetch_revenue_centers(*, company_id):
         return list(response.data or [])
     except Exception:
         return []
+
+
+@cache.cached("vat_types", ttl=timedelta(hours=24))
+def fetch_vat_types(*, company_id):
+    """Tipi IVA dell'account FIC. Usato per risolvere l'ID corretto dato un'aliquota."""
+    try:
+        response = info_api.list_vat_types(company_id=company_id)
+        return [v.to_dict() for v in (response.data or [])]
+    except Exception:
+        return []
+
+
+def find_vat_type_id(rate, keywords=None, company_id=None):
+    """Restituisce l'ID FIC del tipo IVA che corrisponde a `rate`.
+    Per rate=0 cerca tipi con 'art. 10' o 'esente' nella descrizione.
+    Ritorna None se non trovato (il chiamante usa id=0 come fallback)."""
+    if company_id is None:
+        company_id = COMPANY_ID
+    vat_types = fetch_vat_types(company_id=company_id)
+    if not vat_types:
+        return None
+    candidates = [v for v in vat_types if v.get("value") == rate]
+    if not candidates:
+        return None
+    if rate == 0 and keywords is None:
+        keywords = ["art. 10", "art.10", "esente"]
+    if keywords:
+        for kw in keywords:
+            for c in candidates:
+                desc = (c.get("description") or "").lower()
+                if kw.lower() in desc:
+                    return c["id"]
+    return candidates[0]["id"]
 
 
 def build_entity_from_client(client_id, client_data=None):
@@ -152,23 +195,32 @@ def build_entity_from_client(client_id, client_data=None):
 def build_items_list(items_data, negate=False):
     items_list = []
     for item in items_data:
-        vat_rate = item.get("vat_rate", 22)
+        vat_id = item.get("vat_id")
+        # Se vat_id è esplicito (tipo esenzione), default rate=0; altrimenti default 22
+        default_rate = 0 if vat_id is not None else 22
+        vat_rate = item.get("vat_rate", default_rate)
         net_price = item["net_price"]
         if negate:
             net_price = -abs(net_price)
+        # Usa vat_id esplicito se fornito, altrimenti cerca in FIC il tipo corretto
+        if vat_id is None:
+            resolved = find_vat_type_id(vat_rate)
+            vat_id = resolved if resolved is not None else 0
         items_list.append({
             "name": item["name"],
             "description": item.get("description", ""),
             "qty": item["qty"],
             "net_price": net_price,
-            "vat": {"id": 0, "value": vat_rate}
+            "vat": {"id": vat_id, "value": vat_rate}
         })
     return items_list
 
 
 def build_issued_document(doc_type, client_id, items_data, date_str, payment_days,
                           visible_subject, negate_prices=False, source_invoice_id=None,
-                          revenue_center=None):
+                          revenue_center=None, disable_cassa=False, disable_withholding_tax=False,
+                          electronic=True, withholding_rate_pct=20.0, withholding_on_bollo=False,
+                          number=None, numeration=None):
     client_data = get_client_by_id(client_id)
     if not client_data:
         return None, f"Cliente con ID {client_id} non trovato"
@@ -186,11 +238,31 @@ def build_issued_document(doc_type, client_id, items_data, date_str, payment_day
 
     invoice_date = datetime.strptime(date_str, "%Y-%m-%d")
     due_date = invoice_date + timedelta(days=payment_days)
+
+    BOLLO_VAT_ID = 21  # art. 15 DPR 633/72 — bollo, escluso da ritenuta di default
+
     total_abs = sum(
         abs(i["qty"] * i["net_price"]) * (1 + i["vat"]["value"] / 100)
         for i in items_list
     )
     result_total = -total_abs if negate_prices else total_abs
+
+    # Calcolo ritenuta e pagamento
+    if not disable_withholding_tax and withholding_rate_pct > 0:
+        # Base imponibile ritenuta: esclude bollo (art.15) salvo eccezione Cidimu
+        if withholding_on_bollo:
+            withholding_base = total_abs
+        else:
+            withholding_base = sum(
+                abs(i["qty"] * i["net_price"]) * (1 + i["vat"]["value"] / 100)
+                for i in items_list
+                if i["vat"].get("id") != BOLLO_VAT_ID
+            )
+        withholding_amount = round(withholding_base * withholding_rate_pct / 100, 2)
+        payment_amount = round(total_abs - withholding_amount, 2)
+    else:
+        withholding_base = None
+        payment_amount = round(total_abs, 2)
 
     body_data = {
         "type": doc_type,
@@ -199,20 +271,40 @@ def build_issued_document(doc_type, client_id, items_data, date_str, payment_day
         "visible_subject": visible_subject,
         "items_list": items_list,
         "payments_list": [{
-            "amount": round(total_abs, 2),
+            "amount": payment_amount,
             "due_date": due_date.strftime("%Y-%m-%d"),
             "status": "not_paid",
             "payment_terms": {"days": payment_days, "type": "standard"}
         }]
     }
+    # Imposta esplicitamente la base ritenuta in FIC (percentuale 0-100, NON valore assoluto)
+    if withholding_base is not None:
+        body_data["withholding_tax_taxable"] = round(withholding_base / total_abs * 100, 4)
+        # Causale ritenuta obbligatoria per XML SdI: "A" = lavoro autonomo abituale
+        if electronic:
+            body_data["ei_withholding_tax_causal"] = "A"
 
+    if number is not None:
+        body_data["number"] = number
+    if numeration is not None:
+        body_data["numeration"] = numeration
     if revenue_center:
         body_data["rc_center"] = revenue_center
-    if doc_type in ("invoice", "credit_note"):
+    if doc_type in ("invoice", "credit_note") and electronic:
         body_data["e_invoice"] = True
         body_data["ei_data"] = {"payment_method": "MP05"}
+    elif doc_type in ("invoice", "credit_note") and not electronic:
+        body_data["e_invoice"] = False
+        # Fatture serie F = pazienti privati → obbligo invio Sistema Tessera Sanitaria
+        body_data["ts_communication"] = True
     if source_invoice_id:
         body_data["original_document"] = {"id": source_invoice_id}
+    if disable_cassa:
+        body_data["cassa"] = 0
+        body_data["cassa_taxable"] = 0
+    if disable_withholding_tax:
+        body_data["withholding_tax"] = 0
+        body_data["withholding_tax_taxable"] = 0
 
     response = issued_api.create_issued_document(
         company_id=COMPANY_ID,
@@ -248,7 +340,8 @@ async def list_tools():
             "description": {"type": "string", "description": "Descrizione estesa"},
             "qty": {"type": "number", "description": "Quantità"},
             "net_price": {"type": "number", "description": "Prezzo netto unitario (sempre positivo)"},
-            "vat_rate": {"type": "number", "description": "Aliquota IVA (es. 22)"}
+            "vat_rate": {"type": "number", "description": "Aliquota IVA (es. 22)"},
+            "vat_id": {"type": "integer", "description": "ID tipo IVA FIC (opzionale, sovrascrive la ricerca automatica — vedi list_vat_types)"}
         },
         "required": ["name", "qty", "net_price"]
     }
@@ -358,7 +451,13 @@ async def list_tools():
         ),
         Tool(
             name="create_invoice",
-            description="Crea nuova fattura (bozza). IMPORTANTE: Chiedere sempre conferma all'utente prima di eseguire.",
+            description=(
+                "Crea fattura. "
+                "Per pazienti privati (serie F, no SdI — Fornaca, Cellini, studio): usa electronic=false e finalize=true. "
+                "Questo sostituisce l'intero percorso proforma→converti→finalizza in un'unica chiamata. "
+                "Per B2B con SdI: electronic=true (default), poi usa send_to_sdi. "
+                "IMPORTANTE: Chiedere sempre conferma all'utente prima di eseguire."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -367,7 +466,14 @@ async def list_tools():
                     "date": {"type": "string", "description": "Data YYYY-MM-DD (default: oggi)"},
                     "payment_days": {"type": "integer", "description": "Giorni pagamento (default: 30)"},
                     "visible_subject": {"type": "string", "description": "Oggetto visibile"},
-                    "revenue_center": {"type": "string", "description": "Centro di ricavo (opzionale, deve esistere — vedi list_cost_centers)"}
+                    "revenue_center": {"type": "string", "description": "Centro di ricavo (opzionale, deve esistere — vedi list_cost_centers)"},
+                    "disable_cassa": {"type": "boolean", "description": "Disabilita cassa previdenziale (default false). True per pazienti privati."},
+                    "disable_withholding_tax": {"type": "boolean", "description": "Disabilita ritenuta d'acconto (default false). True per pazienti privati."},
+                    "electronic": {"type": "boolean", "description": "Fattura elettronica SdI (default: true). False per pazienti privati (serie F, no SdI)."},
+                    "finalize": {"type": "boolean", "description": "Finalizza subito (locked=True, non modificabile). True per pazienti privati. Default: false."},
+                    "withholding_on_bollo": {"type": "boolean", "description": "Applica ritenuta anche sulla marca da bollo (default: false). True solo per Cidimu."},
+                    "number": {"type": "integer", "description": "Numero fattura (opzionale). Usare solo per la PRIMA fattura di un nuovo sezionale, es. 137 per avviare la serie FE da FE137/2026."},
+                    "numeration": {"type": "string", "description": "Sezionale (opzionale). Es. 'FE' per fatture elettroniche B2B. Dopo la prima, FIC auto-incrementa."}
                 },
                 "required": ["client_id", "items"]
             },
@@ -385,7 +491,11 @@ async def list_tools():
                     "payment_days": {"type": "integer", "description": "Giorni pagamento (default: 30)"},
                     "visible_subject": {"type": "string", "description": "Oggetto visibile"},
                     "source_invoice_id": {"type": "integer", "description": "ID fattura originale da stornare (opzionale)"},
-                    "revenue_center": {"type": "string", "description": "Centro di ricavo (opzionale, deve esistere — vedi list_cost_centers)"}
+                    "revenue_center": {"type": "string", "description": "Centro di ricavo (opzionale, deve esistere — vedi list_cost_centers)"},
+                    "disable_cassa": {"type": "boolean", "description": "Disabilita cassa previdenziale (default false)."},
+                    "disable_withholding_tax": {"type": "boolean", "description": "Disabilita ritenuta d'acconto (default false)."},
+                    "withholding_on_bollo": {"type": "boolean", "description": "Applica ritenuta anche sulla marca da bollo (default: false). True per Cidimu e CDC — deve rispecchiare il trattamento della fattura originale che si sta stornando."},
+                    "electronic": {"type": "boolean", "description": "Nota di credito elettronica SdI (default: true). False per pazienti privati (serie F)."}
                 },
                 "required": ["client_id", "items"]
             },
@@ -393,7 +503,7 @@ async def list_tools():
         ),
         Tool(
             name="create_proforma",
-            description="Crea proforma (bozza). Non inviabile allo SDI. IMPORTANTE: Chiedere sempre conferma all'utente prima di eseguire.",
+            description="Crea proforma (bozza). Non inviabile allo SDI. Usare per pazienti privati (serie F). IMPORTANTE: Chiedere sempre conferma all'utente prima di eseguire.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -402,22 +512,31 @@ async def list_tools():
                     "date": {"type": "string", "description": "Data YYYY-MM-DD (default: oggi)"},
                     "payment_days": {"type": "integer", "description": "Giorni pagamento (default: 30)"},
                     "visible_subject": {"type": "string", "description": "Oggetto visibile"},
-                    "revenue_center": {"type": "string", "description": "Centro di ricavo (opzionale, deve esistere — vedi list_cost_centers)"}
+                    "revenue_center": {"type": "string", "description": "Centro di ricavo (opzionale, deve esistere — vedi list_cost_centers)"},
+                    "disable_cassa": {"type": "boolean", "description": "Disabilita cassa previdenziale (default false). True per pazienti privati."},
+                    "disable_withholding_tax": {"type": "boolean", "description": "Disabilita ritenuta d'acconto (default false). True per pazienti privati."}
                 },
                 "required": ["client_id", "items"]
             },
             annotations=_ann(),
         ),
         Tool(
+            name="list_vat_types",
+            description="Lista tipi IVA configurati in FattureInCloud. Utile per trovare l'ID corretto da passare come vat_id negli items. Read-only.",
+            inputSchema={"type": "object", "properties": {}},
+            annotations=_ann(read_only=True, idempotent=True),
+        ),
+        Tool(
             name="convert_proforma_to_invoice",
-            description="Converte una proforma in fattura elettronica (bozza). Di default elimina la proforma originale. IMPORTANTE: Chiedere sempre conferma all'utente prima di eseguire.",
+            description="Converte una proforma in fattura (bozza). Di default crea fattura elettronica (SdI). Per pazienti privati usare electronic=false. Di default elimina la proforma originale. IMPORTANTE: Chiedere sempre conferma all'utente prima di eseguire.",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "document_id": {"type": "integer", "description": "ID proforma da convertire"},
                     "date": {"type": "string", "description": "Data fattura YYYY-MM-DD (default: data proforma)"},
                     "keep_proforma": {"type": "boolean", "description": "Mantieni la proforma originale (default: false)"},
-                    "revenue_center": {"type": "string", "description": "Centro di ricavo (opzionale, eredita da proforma se non passato)"}
+                    "revenue_center": {"type": "string", "description": "Centro di ricavo (opzionale, eredita da proforma se non passato)"},
+                    "electronic": {"type": "boolean", "description": "Crea fattura elettronica SdI (default: true). Usare false per pazienti privati (no SdI)."}
                 },
                 "required": ["document_id"]
             },
@@ -556,6 +675,38 @@ async def list_tools():
                 "required": ["year"]
             },
             annotations=_ann(read_only=True, idempotent=True),
+        ),
+        Tool(
+            name="list_payment_accounts",
+            description="Lista conti di pagamento configurati in FattureInCloud (banca, POS, cassa, ecc.). Utile per trovare l'ID del conto da usare in mark_as_paid. Read-only.",
+            inputSchema={"type": "object", "properties": {}},
+            annotations=_ann(read_only=True, idempotent=True),
+        ),
+        Tool(
+            name="finalize_invoice",
+            description="Finalizza una fattura bozza (non elettronica) rendendola emessa e non modificabile (locked=True). Per fatture pazienti privati serie F. IMPORTANTE: Chiedere conferma prima di eseguire.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "document_id": {"type": "integer", "description": "ID documento da finalizzare"}
+                },
+                "required": ["document_id"]
+            },
+            annotations=_ann(idempotent=True),
+        ),
+        Tool(
+            name="mark_as_paid",
+            description="Segna una fattura o proforma come pagata, aggiornando lo stato del pagamento. IMPORTANTE: Chiedere conferma all'utente prima di eseguire.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "document_id": {"type": "integer", "description": "ID documento"},
+                    "paid_date": {"type": "string", "description": "Data incasso YYYY-MM-DD (default: oggi)"},
+                    "payment_account_id": {"type": "integer", "description": "ID conto di pagamento FIC (vedi list_payment_accounts). Opzionale."}
+                },
+                "required": ["document_id"]
+            },
+            annotations=_ann(idempotent=True),
         ),
         Tool(
             name="list_cost_centers",
@@ -783,6 +934,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return [TextContent(type="text", text=json.dumps(result, indent=2, ensure_ascii=False))]
 
         elif name == "create_invoice":
+            electronic = arguments.get("electronic", True)
+            finalize = arguments.get("finalize", False)
             result, error = build_issued_document(
                 doc_type="invoice",
                 client_id=arguments["client_id"],
@@ -791,10 +944,55 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 payment_days=arguments.get("payment_days", 30),
                 visible_subject=arguments.get("visible_subject", ""),
                 revenue_center=arguments.get("revenue_center"),
+                disable_cassa=arguments.get("disable_cassa", False),
+                disable_withholding_tax=arguments.get("disable_withholding_tax", False),
+                electronic=electronic,
+                withholding_on_bollo=arguments.get("withholding_on_bollo", False),
+                number=arguments.get("number"),
+                numeration=arguments.get("numeration"),
             )
             if error:
                 return [TextContent(type="text", text=json.dumps({"success": False, "error": error}, ensure_ascii=False))]
-            result["message"] = f"Fattura #{result['number']} creata come bozza. SDI: {result['ei_code']}. Usa send_to_sdi per inviarla."
+            if finalize:
+                doc_id = result["id"]
+                orig_resp = issued_api.get_issued_document(
+                    company_id=COMPANY_ID, document_id=doc_id, fieldset="detailed"
+                )
+                orig = orig_resp.data.to_dict()
+                items_list = [
+                    {"id": i.get("id"), "product_id": i.get("product", {}).get("id") if i.get("product") else None,
+                     "name": i.get("name", ""), "description": i.get("description", ""),
+                     "qty": i.get("qty", 1), "net_price": i.get("net_price", 0),
+                     "vat": i.get("vat")}
+                    for i in orig.get("items_list", [])
+                ]
+                payments = orig.get("payments_list") or []
+                fin_body = {
+                    "type": orig.get("type"),
+                    "entity": orig.get("entity"),
+                    "date": orig.get("date").strftime("%Y-%m-%d") if hasattr(orig.get("date"), "strftime") else str(orig.get("date", ""))[:10],
+                    "visible_subject": orig.get("visible_subject", ""),
+                    "items_list": items_list,
+                    "payments_list": payments,
+                    "e_invoice": orig.get("e_invoice", False),
+                    "locked": True,
+                }
+                if orig.get("ei_data"):
+                    fin_body["ei_data"] = orig.get("ei_data")
+                for field in ["rc_center", "cassa", "cassa_taxable", "withholding_tax", "withholding_tax_taxable"]:
+                    if orig.get(field) is not None:
+                        fin_body[field] = orig[field]
+                issued_api.modify_issued_document(
+                    company_id=COMPANY_ID, document_id=doc_id,
+                    modify_issued_document_request={"data": fin_body}
+                )
+                result["finalized"] = True
+            if electronic:
+                result["message"] = f"Fattura #{result['number']} creata come bozza (elettronica). SDI: {result['ei_code']}. Usa send_to_sdi per inviarla."
+            elif finalize:
+                result["message"] = f"Fattura #{result['number']} creata e finalizzata (serie F, non elettronica)."
+            else:
+                result["message"] = f"Fattura #{result['number']} creata come bozza (serie F, non elettronica)."
             return [TextContent(type="text", text=json.dumps(result, indent=2, ensure_ascii=False))]
 
         elif name == "create_credit_note":
@@ -808,6 +1006,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 negate_prices=True,
                 source_invoice_id=arguments.get("source_invoice_id"),
                 revenue_center=arguments.get("revenue_center"),
+                disable_cassa=arguments.get("disable_cassa", False),
+                disable_withholding_tax=arguments.get("disable_withholding_tax", False),
+                withholding_on_bollo=arguments.get("withholding_on_bollo", False),
+                electronic=arguments.get("electronic", True),
             )
             if error:
                 return [TextContent(type="text", text=json.dumps({"success": False, "error": error}, ensure_ascii=False))]
@@ -827,10 +1029,20 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 payment_days=arguments.get("payment_days", 30),
                 visible_subject=arguments.get("visible_subject", ""),
                 revenue_center=arguments.get("revenue_center"),
+                disable_cassa=arguments.get("disable_cassa", False),
+                disable_withholding_tax=arguments.get("disable_withholding_tax", False),
             )
             if error:
                 return [TextContent(type="text", text=json.dumps({"success": False, "error": error}, ensure_ascii=False))]
             result["message"] = f"Proforma #{result['number']} creata come bozza. Non inviabile allo SDI."
+            return [TextContent(type="text", text=json.dumps(result, indent=2, ensure_ascii=False))]
+
+        elif name == "list_vat_types":
+            vat_types = fetch_vat_types(company_id=COMPANY_ID)
+            result = [
+                {"id": v.get("id"), "value": v.get("value"), "description": v.get("description")}
+                for v in vat_types
+            ]
             return [TextContent(type="text", text=json.dumps(result, indent=2, ensure_ascii=False))]
 
         elif name == "convert_proforma_to_invoice":
@@ -854,6 +1066,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
             date_str = arguments.get("date") or str(orig.get("date", datetime.now().strftime("%Y-%m-%d")))
 
+            electronic = arguments.get("electronic", True)
+
             items_list = []
             for i in orig.get("items_list", []):
                 items_list.append({
@@ -861,7 +1075,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     "description": i.get("description", ""),
                     "qty": i.get("qty"),
                     "net_price": abs(i.get("net_price", 0)),
-                    "vat": {"id": 0, "value": i.get("vat", {}).get("value", 22)}
+                    "vat": {
+                        "id": i.get("vat", {}).get("id", 0),
+                        "value": i.get("vat", {}).get("value", 22)
+                    }
                 })
 
             orig_payments = orig.get("payments_list", [{}])
@@ -882,8 +1099,6 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
             body_data = {
                 "type": "invoice",
-                "e_invoice": True,
-                "ei_data": {"payment_method": "MP05"},
                 "entity": entity,
                 "date": date_str[:10],
                 "visible_subject": orig.get("visible_subject", ""),
@@ -895,8 +1110,17 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     "payment_terms": {"days": payment_days, "type": "standard"}
                 }]
             }
+            if electronic:
+                body_data["e_invoice"] = True
+                body_data["ei_data"] = {"payment_method": "MP05"}
+            else:
+                body_data["e_invoice"] = False
             if revenue_center:
                 body_data["rc_center"] = revenue_center
+            # Preserva cassa e ritenuta dal documento originale
+            for field in ["cassa", "cassa_taxable", "withholding_tax", "withholding_tax_taxable"]:
+                if orig.get(field) is not None:
+                    body_data[field] = orig[field]
             body = {"data": body_data}
 
             response = issued_api.create_issued_document(
@@ -954,7 +1178,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                         "description": i.get("description", ""),
                         "qty": i.get("qty"),
                         "net_price": abs(i.get("net_price", 0)),
-                        "vat": {"id": 0, "value": i.get("vat", {}).get("value", 22)}
+                        "vat": {
+                            "id": i.get("vat", {}).get("id", 0),
+                            "value": i.get("vat", {}).get("value", 22)
+                        }
                     })
 
             if "payment_days" in arguments:
@@ -1007,6 +1234,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 body_data["ei_data"] = {"payment_method": "MP05"}
             if orig.get("original_document"):
                 body_data["original_document"] = orig["original_document"]
+            # Preserva cassa e ritenuta dal documento originale
+            for field in ["cassa", "cassa_taxable", "withholding_tax", "withholding_tax_taxable"]:
+                if orig.get(field) is not None:
+                    body_data[field] = orig[field]
 
             response = issued_api.modify_issued_document(
                 company_id=COMPANY_ID,
@@ -1056,7 +1287,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 items_list.append({
                     "name": iname, "description": idesc,
                     "qty": i.get("qty"), "net_price": i.get("net_price"),
-                    "vat": {"id": 0, "value": i.get("vat", {}).get("value", 22)}
+                    "vat": {
+                        "id": i.get("vat", {}).get("id", 0),
+                        "value": i.get("vat", {}).get("value", 22)
+                    }
                 })
 
             visible_subject = orig.get("visible_subject", "")
@@ -1348,6 +1582,177 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 "status": "✓ Numerazione continua" if len(gaps) == 0 else f"⚠ Trovati {len(gaps)} problemi",
                 "gaps": gaps
             }
+            return [TextContent(type="text", text=json.dumps(result, indent=2, ensure_ascii=False))]
+
+        elif name == "finalize_invoice":
+            doc_id = arguments["document_id"]
+
+            orig_resp = issued_api.get_issued_document(
+                company_id=COMPANY_ID, document_id=doc_id, fieldset="detailed"
+            )
+            orig = orig_resp.data.to_dict()
+
+            if orig.get("locked"):
+                return [TextContent(type="text", text=json.dumps({
+                    "success": True, "id": doc_id,
+                    "number": orig.get("number"),
+                    "message": f"Fattura #{orig.get('number')} è già finalizzata."
+                }, ensure_ascii=False))]
+
+            items_list = []
+            for i in orig.get("items_list", []):
+                items_list.append({
+                    "name": i.get("name", ""),
+                    "description": i.get("description", ""),
+                    "qty": i.get("qty"),
+                    "net_price": abs(i.get("net_price", 0)),
+                    "vat": {
+                        "id": i.get("vat", {}).get("id", 0),
+                        "value": i.get("vat", {}).get("value", 0)
+                    }
+                })
+
+            orig_payments = orig.get("payments_list", [{}])
+            payment_days = orig_payments[0].get("payment_terms", {}).get("days", 30) if orig_payments else 30
+            date_str = str(orig.get("date", datetime.now().strftime("%Y-%m-%d")))
+            invoice_date = datetime.strptime(date_str[:10], "%Y-%m-%d")
+            due_date = invoice_date + timedelta(days=payment_days)
+            total_gross = sum(abs(i["qty"] * i["net_price"]) * (1 + i["vat"]["value"] / 100) for i in items_list)
+
+            entity = orig.get("entity", {})
+            doc_type = orig.get("type", "invoice")
+
+            body_data = {
+                "type": doc_type,
+                "entity": entity,
+                "date": date_str[:10],
+                "visible_subject": orig.get("visible_subject", ""),
+                "items_list": items_list,
+                "payments_list": [{
+                    "amount": round(total_gross, 2),
+                    "due_date": due_date.strftime("%Y-%m-%d"),
+                    "status": "not_paid",
+                    "payment_terms": {"days": payment_days, "type": "standard"}
+                }],
+                "locked": True
+            }
+            if orig.get("e_invoice") is not None:
+                body_data["e_invoice"] = orig["e_invoice"]
+            if orig.get("ei_data"):
+                body_data["ei_data"] = orig["ei_data"]
+            if orig.get("rc_center"):
+                body_data["rc_center"] = orig["rc_center"]
+            for field in ["cassa", "cassa_taxable", "withholding_tax", "withholding_tax_taxable"]:
+                if orig.get(field) is not None:
+                    body_data[field] = orig[field]
+
+            response = issued_api.modify_issued_document(
+                company_id=COMPANY_ID,
+                document_id=doc_id,
+                modify_issued_document_request={"data": body_data}
+            )
+            d = response.data.to_dict()
+
+            result = {
+                "success": True,
+                "id": d.get("id"),
+                "number": d.get("number"),
+                "client": entity.get("name", ""),
+                "date": date_str[:10],
+                "total": round(total_gross, 2),
+                "message": f"Fattura #{d.get('number')} finalizzata — non più bozza."
+            }
+            return [TextContent(type="text", text=json.dumps(result, indent=2, ensure_ascii=False))]
+
+        elif name == "list_payment_accounts":
+            accounts = fetch_payment_accounts(company_id=COMPANY_ID)
+            result = [
+                {"id": a.get("id"), "name": a.get("name"), "type": str(a.get("type", ""))}
+                for a in accounts
+            ]
+            return [TextContent(type="text", text=json.dumps(result, indent=2, ensure_ascii=False))]
+
+        elif name == "mark_as_paid":
+            doc_id = arguments["document_id"]
+            paid_date = arguments.get("paid_date", datetime.now().strftime("%Y-%m-%d"))
+            payment_account_id = arguments.get("payment_account_id")
+
+            # Leggi il documento originale
+            orig_resp = issued_api.get_issued_document(
+                company_id=COMPANY_ID, document_id=doc_id, fieldset="detailed"
+            )
+            orig = orig_resp.data.to_dict()
+
+            doc_type = orig.get("type", "invoice")
+            entity = orig.get("entity", {})
+            date_str = str(orig.get("date", datetime.now().strftime("%Y-%m-%d")))
+            visible_subject = orig.get("visible_subject", "")
+
+            # Ricostruisci items preservando VAT ID e prezzi originali
+            items_list = []
+            for i in orig.get("items_list", []):
+                items_list.append({
+                    "name": i.get("name", ""),
+                    "description": i.get("description", ""),
+                    "qty": i.get("qty"),
+                    "net_price": i.get("net_price", 0),
+                    "vat": {
+                        "id": i.get("vat", {}).get("id", 0),
+                        "value": i.get("vat", {}).get("value", 0)
+                    }
+                })
+
+            # Costruisci pagamento come incassato
+            orig_payments = orig.get("payments_list", [{}])
+            payment_days = orig_payments[0].get("payment_terms", {}).get("days", 0) if orig_payments else 0
+            total = sum(abs(i["qty"] * i["net_price"]) for i in items_list)
+
+            payment = {
+                "amount": round(total, 2),
+                "due_date": paid_date,
+                "paid_date": paid_date,
+                "status": "paid",
+                "payment_terms": {"days": payment_days, "type": "standard"}
+            }
+            if payment_account_id:
+                payment["payment_account"] = {"id": payment_account_id}
+
+            body_data = {
+                "type": doc_type,
+                "entity": entity,
+                "date": date_str[:10],
+                "visible_subject": visible_subject,
+                "items_list": items_list,
+                "payments_list": [payment]
+            }
+            if doc_type in ("invoice", "credit_note") and orig.get("e_invoice"):
+                body_data["e_invoice"] = orig.get("e_invoice", False)
+                if orig.get("ei_data"):
+                    body_data["ei_data"] = orig["ei_data"]
+            # Preserva cassa e ritenuta
+            for field in ["cassa", "cassa_taxable", "withholding_tax", "withholding_tax_taxable"]:
+                if orig.get(field) is not None:
+                    body_data[field] = orig[field]
+            if orig.get("rc_center"):
+                body_data["rc_center"] = orig["rc_center"]
+
+            response = issued_api.modify_issued_document(
+                company_id=COMPANY_ID,
+                document_id=doc_id,
+                modify_issued_document_request={"data": body_data}
+            )
+            d = response.data.to_dict()
+            result = {
+                "success": True,
+                "id": d.get("id"),
+                "number": d.get("number"),
+                "client": entity.get("name", ""),
+                "paid_date": paid_date,
+                "total": round(total, 2),
+                "message": f"Fattura #{d.get('number')} segnata come pagata in data {paid_date}."
+            }
+            if payment_account_id:
+                result["payment_account_id"] = payment_account_id
             return [TextContent(type="text", text=json.dumps(result, indent=2, ensure_ascii=False))]
 
         elif name == "list_cost_centers":
