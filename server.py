@@ -1683,35 +1683,16 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             )
             orig = orig_resp.data.to_dict()
 
-            doc_type = orig.get("type", "invoice")
             entity = orig.get("entity", {})
-            date_str = str(orig.get("date", datetime.now().strftime("%Y-%m-%d")))
-            visible_subject = orig.get("visible_subject", "")
 
-            # Ricostruisci items preservando VAT ID e prezzi originali
-            items_list = []
-            for i in orig.get("items_list", []):
-                items_list.append({
-                    "name": i.get("name", ""),
-                    "description": i.get("description", ""),
-                    "qty": i.get("qty"),
-                    "net_price": i.get("net_price", 0),
-                    "vat": {
-                        "id": i.get("vat", {}).get("id", 0),
-                        "value": i.get("vat", {}).get("value", 0)
-                    }
-                })
-
-            # Costruisci pagamento come incassato.
+            # Costruisci il pagamento come incassato.
             #
             # L'importo NON si ricalcola dalle righe: FattureInCloud ha gia'
-            # scritto in payments_list il dovuto reale, gia' comprensivo del
-            # bollo di documento (`stamp_duty`) e gia' al netto della ritenuta
-            # d'acconto. Ricalcolarlo dalle sole righe sbagliava in due modi:
-            #   - bollo nel campo `stamp_duty` invece che come riga -> -2 EUR
-            #   - ritenuta d'acconto -> +20% (es. 335,00 invece di 268,00)
-            # In entrambi i casi l'API rispondeva 422 "Il totale dei pagamenti
-            # non corrisponde al totale da pagare".
+            # scritto in payments_list il dovuto reale, comprensivo del bollo
+            # di documento (`stamp_duty`) e al netto di cassa e ritenuta
+            # d'acconto. Il ricalcolo sbagliava perche' non poteva conoscere i
+            # flag per riga (`apply_cassa`, `apply_withholding_taxes`), che
+            # decidono se cassa e ritenuta si applichino davvero.
             orig_payments = orig.get("payments_list") or []
             if len(orig_payments) > 1:
                 return [TextContent(type="text", text=json.dumps({
@@ -1734,7 +1715,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             else:
                 # Nessuna scadenza registrata: ricostruisci il dovuto dalle
                 # righe, aggiungendo il bollo se e' a livello documento.
-                total = sum(abs(i["qty"] * i["net_price"]) for i in items_list)
+                total = sum(abs((i.get("qty") or 0) * (i.get("net_price") or 0))
+                            for i in orig.get("items_list") or [])
                 total += float(orig.get("stamp_duty") or 0)
 
             payment = {
@@ -1754,34 +1736,16 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     "id": orig_payment["payment_account"].get("id")
                 }
 
-            locked = bool(orig.get("ei_status"))
-            if locked:
-                # Documento gia' trasmesso a SdI: `items_list` e' bloccato e un
-                # PUT che lo includa risponde 409 "The document is locked.
-                # Cannot edit items_list core data". `items_list` e
-                # `payments_list` sono entrambi opzionali nell'SDK e i campi
-                # None non vengono serializzati: il PUT parziale tocca solo
-                # payments_list e lascia intatto il resto del documento.
-                body_data = {"payments_list": [payment]}
-            else:
-                body_data = {
-                    "type": doc_type,
-                    "entity": entity,
-                    "date": date_str[:10],
-                    "visible_subject": visible_subject,
-                    "items_list": items_list,
-                    "payments_list": [payment]
-                }
-                if doc_type in ("invoice", "credit_note") and orig.get("e_invoice"):
-                    body_data["e_invoice"] = orig.get("e_invoice", False)
-                    if orig.get("ei_data"):
-                        body_data["ei_data"] = orig["ei_data"]
-                # Preserva cassa e ritenuta
-                for field in ["cassa", "cassa_taxable", "withholding_tax", "withholding_tax_taxable"]:
-                    if orig.get(field) is not None:
-                        body_data[field] = orig[field]
-                if orig.get("rc_center"):
-                    body_data["rc_center"] = orig["rc_center"]
+            # PUT parziale, SEMPRE — anche sui documenti non bloccati.
+            # Verificato il 02/09/2026 con get_existing_issued_document_totals
+            # (endpoint read-only) sulla fattura #27, ei_status null: un corpo
+            # con la sola payments_list viene FUSO su quello salvato, le righe
+            # restano (amount_net 160) e cassa/ritenuta restano ai valori reali.
+            # Ricostruire il documento era invece distruttivo: copiando le righe
+            # si perdevano `apply_cassa` e `apply_withholding_taxes`, il server
+            # li ridefaultava ad "applica" e il dovuto passava da 162,00 a
+            # 133,20 -> 422 "Il totale dei pagamenti non corrisponde".
+            body_data = {"payments_list": [payment]}
 
             response = issued_api.modify_issued_document(
                 company_id=COMPANY_ID,
@@ -1800,8 +1764,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             }
             if payment_account_id:
                 result["payment_account_id"] = payment_account_id
-            if locked:
-                result["mode"] = "put_parziale_documento_trasmesso"
+            result["ei_status"] = orig.get("ei_status")
             return [TextContent(type="text", text=json.dumps(result, indent=2, ensure_ascii=False))]
 
         elif name == "list_cost_centers":
