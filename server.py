@@ -1495,10 +1495,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     continue
                 totale_fatturato += get_total_from_doc(d)
                 for p in d.get('payments_list', []):
-                    status = str(p.get('status', '')).replace('IssuedDocumentStatus.', '')
-                    if status == 'paid':
+                    status = str(p.get('status', '')).replace('IssuedDocumentStatus.', '').upper()
+                    if status == 'PAID':
                         totale_incassato += p.get('amount', 0)
-                    elif status == 'not_paid':
+                    elif status == 'NOT_PAID':
                         fatture_non_pagate.append({
                             "number": d.get("number"),
                             "client": client_name,
