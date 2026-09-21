@@ -268,6 +268,66 @@ def test_create_invoice_without_bollo_never_reaches_fic(server_module):
     assert create.call_count == 0
 
 
+def _orig(doc, number=31, locked=False):
+    resp = MagicMock()
+    resp.data.to_dict.return_value = dict(doc, id=1, number=number, locked=locked, date="2026-07-17",
+                                          ei_status=None, entity=dict(doc["entity"], id=7))
+    return resp
+
+
+def _update(server, args, orig_doc, client_vat=""):
+    modified = MagicMock()
+    modified.data.to_dict.return_value = {"id": 1, "number": 31, "date": "2026-07-17"}
+    client = MagicMock()
+    client.data.to_dict.return_value = {"id": 7, "name": "Cliente test", "vat_number": client_vat, "ei_code": ""}
+    with patch.object(server.issued_api, "get_issued_document", return_value=_orig(orig_doc)), \
+         patch.object(server.clients_api, "get_client", return_value=client), \
+         patch.object(server.issued_api, "modify_issued_document", return_value=modified) as m:
+        out = json.loads(asyncio.run(server.call_tool("update_document", args))[0].text)
+    body = m.call_args.kwargs["modify_issued_document_request"]["data"] if m.call_args else None
+    return out, body, m
+
+
+def test_update_document_removes_withholding_on_patient_invoice(server_module):
+    # F31: fattura al paziente emessa per errore con ritenuta 20% (netto 3.719,60)
+    orig = stored("", [prest(4647), bollo(21)], 3719.60, e_invoice=False)
+    orig["withholding_tax"] = 20
+    orig["withholding_tax_taxable"] = 99.957
+    out, body, _ = _update(server_module, {"document_id": 1, "disable_withholding_tax": True}, orig)
+    assert out["success"] is True
+    assert body["payments_list"][0]["amount"] == 4649.00
+    assert body["withholding_tax"] == 0
+    assert body["withholding_tax_taxable"] == 0
+
+
+def test_update_document_keeps_invoice_non_electronic(server_module):
+    orig = stored("", [prest(4647), bollo(21)], 3719.60, e_invoice=False)
+    orig["withholding_tax"] = 20
+    _, body, _ = _update(server_module, {"document_id": 1, "disable_withholding_tax": True}, orig)
+    assert body["e_invoice"] is False
+    assert "ei_data" not in body
+
+
+def test_update_document_recomputes_withholding_when_kept(server_module):
+    orig = stored(CELLINI, [prest(200), bollo(21)], 162.00)
+    orig["withholding_tax"] = 20
+    orig["withholding_tax_taxable"] = 50.0  # base vecchia, non più valida
+    _, body, _ = _update(server_module, {"document_id": 1, "items": [
+        {"name": "Intervento", "qty": 1, "net_price": 300, "vat_id": 45},
+        {"name": "Marca da bollo", "qty": 1, "net_price": 2, "vat_id": 21}]}, orig, client_vat=CELLINI)
+    assert body["payments_list"][0]["amount"] == 242.00  # 0,8x300 + 2
+
+
+def test_update_document_blocked_when_result_breaks_rules(server_module):
+    orig = stored("", [prest(4647), bollo(21)], 3719.60, e_invoice=False)
+    orig["withholding_tax"] = 20
+    out, _, m = _update(server_module, {"document_id": 1, "disable_withholding_tax": True,
+                                        "items": [{"name": "Intervento", "qty": 1, "net_price": 4647, "vat_id": 45}]}, orig)
+    assert out["success"] is False
+    assert "Manca la marca da bollo" in out["error"]
+    assert m.call_count == 0
+
+
 def test_create_invoice_fe179_reaches_fic(server_module):
     s = server_module
     client = MagicMock()

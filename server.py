@@ -589,7 +589,9 @@ async def list_tools():
                         "items": item_schema,
                         "description": "Nuove righe documento (opzionale). Per NDC, importi sempre positivi."
                     },
-                    "revenue_center": {"type": "string", "description": "Centro di ricavo (opzionale, mantiene quello esistente se non passato)"}
+                    "revenue_center": {"type": "string", "description": "Centro di ricavo (opzionale, mantiene quello esistente se non passato)"},
+                    "disable_withholding_tax": {"type": "boolean", "description": "Rimuove la ritenuta d'acconto e ricalcola il pagamento (per correggere una fattura a paziente privato emessa con ritenuta). Se non passato, la ritenuta del documento viene mantenuta e ricalcolata sulle righe attuali."},
+                    "withholding_on_bollo": {"type": "boolean", "description": "Se la ritenuta resta attiva, includere anche il bollo nella base (Cidimu e CDC). Default false."}
                 },
                 "required": ["document_id"]
             },
@@ -1230,6 +1232,30 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             )
             result_total = -total_abs if is_credit_note else total_abs
 
+            # Ritenuta: va ricalcolata, non ereditata. Il documento originale porta una
+            # base in percentuale che non vale più se cambiano righe o impostazione.
+            BOLLO_VAT_ID = 21
+            disable_withholding = arguments.get(
+                "disable_withholding_tax",
+                not orig.get("withholding_tax"),
+            )
+            withholding_rate = 0.0 if disable_withholding else float(orig.get("withholding_tax") or 0)
+            withholding_on_bollo = arguments.get("withholding_on_bollo", False)
+            if withholding_rate > 0:
+                if withholding_on_bollo:
+                    withholding_base = total_abs
+                else:
+                    withholding_base = sum(
+                        abs(i["qty"] * i["net_price"]) * (1 + i["vat"]["value"] / 100)
+                        for i in items_list
+                        if i["vat"].get("id") != BOLLO_VAT_ID
+                    )
+                withholding_amount = round(withholding_base * withholding_rate / 100, 2)
+            else:
+                withholding_base = 0.0
+                withholding_amount = 0.0
+            payment_amount = round(total_abs - withholding_amount, 2)
+
             client_id = orig.get("entity", {}).get("id")
             client_data = get_client_by_id(client_id) if client_id else None
             entity = build_entity_from_client(client_id, client_data) if (client_id and client_data) else orig.get("entity", {})
@@ -1253,7 +1279,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 "visible_subject": visible_subject,
                 "items_list": items_list,
                 "payments_list": [{
-                    "amount": round(total_abs, 2),
+                    "amount": payment_amount,
                     "due_date": due_date.strftime("%Y-%m-%d"),
                     "status": "not_paid",
                     "payment_terms": {"days": payment_days, "type": "standard"}
@@ -1261,15 +1287,39 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             }
             if revenue_center:
                 body_data["rc_center"] = revenue_center
+            # e_invoice si eredita: forzarlo a True trasformava una fattura serie F
+            # (paziente, cartacea) in elettronica.
+            was_electronic = bool(orig.get("e_invoice"))
             if doc_type in ("invoice", "credit_note"):
-                body_data["e_invoice"] = True
-                body_data["ei_data"] = {"payment_method": "MP05"}
+                body_data["e_invoice"] = was_electronic
+                if was_electronic:
+                    body_data["ei_data"] = orig.get("ei_data") or {"payment_method": "MP05"}
             if orig.get("original_document"):
                 body_data["original_document"] = orig["original_document"]
-            # Preserva cassa e ritenuta dal documento originale
-            for field in ["cassa", "cassa_taxable", "withholding_tax", "withholding_tax_taxable"]:
+            for field in ["cassa", "cassa_taxable"]:
                 if orig.get(field) is not None:
                     body_data[field] = orig[field]
+            body_data["withholding_tax"] = withholding_rate
+            body_data["withholding_tax_taxable"] = (
+                round(withholding_base / total_abs * 100, 4) if withholding_rate > 0 and total_abs else 0
+            )
+            if withholding_rate > 0 and was_electronic:
+                body_data["ei_withholding_tax_causal"] = orig.get("ei_withholding_tax_causal") or "A"
+
+            errors, warnings = validation.validate({
+                "type": doc_type,
+                "e_invoice": was_electronic,
+                "vat_number": ((client_data or {}).get("vat_number") or entity.get("vat_number") or "").strip(),
+                "client_name": entity.get("name", ""),
+                "items": validation.normalize_items(items_list),
+                "payment_total": payment_amount,
+                "cassa": None,
+            })
+            if errors:
+                return [TextContent(type="text", text=json.dumps({
+                    "success": False,
+                    "error": validation.format_block(errors, warnings, "modifica documento"),
+                }, ensure_ascii=False))]
 
             response = issued_api.modify_issued_document(
                 company_id=COMPANY_ID,
@@ -1286,10 +1336,15 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 "due_date": due_date.strftime("%Y-%m-%d"),
                 "client": (client_data or {}).get("name", entity.get("name", "")),
                 "total": round(result_total, 2),
+                "payment_amount": payment_amount,
+                "withholding_rate": withholding_rate,
+                "e_invoice": was_electronic,
                 "type": doc_type,
                 "status": "bozza",
-                "message": f"Documento #{d.get('number')} aggiornato con successo."
+                "message": f"Documento #{d.get('number')} aggiornato. Netto da pagare {payment_amount}. Verificare con get_invoice."
             }
+            if warnings:
+                result["validation_warnings"] = warnings
             if revenue_center:
                 result["revenue_center"] = revenue_center
             return [TextContent(type="text", text=json.dumps(result, indent=2, ensure_ascii=False))]
