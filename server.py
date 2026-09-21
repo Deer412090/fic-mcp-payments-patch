@@ -26,6 +26,7 @@ from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent, ToolAnnotations
 
 import cache
+import validation
 
 
 def _ann(read_only=False, destructive=False, idempotent=False, open_world=True):
@@ -264,6 +265,32 @@ def build_issued_document(doc_type, client_id, items_data, date_str, payment_day
         withholding_base = None
         payment_amount = round(total_abs, 2)
 
+    validation_warnings = []
+    if doc_type in ("invoice", "credit_note"):
+        source = None
+        if doc_type == "credit_note" and source_invoice_id:
+            try:
+                src = issued_api.get_issued_document(
+                    company_id=COMPANY_ID, document_id=source_invoice_id, fieldset="detailed"
+                ).data.to_dict()
+                source = validation.normalize_stored_document(src)
+            except Exception as e:
+                return None, f"Impossibile leggere la fattura da stornare {source_invoice_id}: {e}"
+        check = {
+            "type": doc_type,
+            "e_invoice": electronic,
+            "vat_number": (client_data.get("vat_number") or "").strip(),
+            "client_name": client_data.get("name", ""),
+            "items": validation.normalize_items(items_list),
+            "payment_total": payment_amount,
+            "cassa": None if disable_cassa else "default FIC",
+            "at_creation": True,
+            "numeration": numeration,
+        }
+        errors, validation_warnings = validation.validate(check, source=source)
+        if errors:
+            return None, validation.format_block(errors, validation_warnings, f"creazione {doc_type}")
+
     body_data = {
         "type": doc_type,
         "entity": entity,
@@ -328,6 +355,8 @@ def build_issued_document(doc_type, client_id, items_data, date_str, payment_day
         result["revenue_center"] = revenue_center
     if source_invoice_id:
         result["linked_to_invoice"] = source_invoice_id
+    if validation_warnings:
+        result["validation_warnings"] = validation_warnings
     return result, None
 
 
@@ -1327,6 +1356,20 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             }
             if revenue_center:
                 body_data["rc_center"] = revenue_center
+            errors, warnings = validation.validate({
+                "type": "invoice",
+                "e_invoice": True,
+                "vat_number": (entity.get("vat_number") or "").strip(),
+                "client_name": entity.get("name", ""),
+                "items": validation.normalize_items(items_list),
+                "payment_total": round(total_gross, 2),
+                "cassa": None,
+            })
+            if errors:
+                return [TextContent(type="text", text=json.dumps({
+                    "success": False,
+                    "error": validation.format_block(errors, warnings, "duplicazione"),
+                }, ensure_ascii=False))]
             body = {"data": body_data}
             response = issued_api.create_issued_document(
                 company_id=COMPANY_ID, create_issued_document_request=body
@@ -1376,6 +1419,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 return [TextContent(type="text", text=json.dumps({
                     "success": False,
                     "error": f"Documento già inviato o in elaborazione. Stato: {current_status}"
+                }, ensure_ascii=False))]
+            errors, warnings = validation.validate(validation.normalize_stored_document(check_data))
+            if errors:
+                return [TextContent(type="text", text=json.dumps({
+                    "success": False,
+                    "error": validation.format_block(errors, warnings, "invio SdI"),
                 }, ensure_ascii=False))]
             einvoice_api.send_e_invoice(
                 company_id=COMPANY_ID, document_id=doc_id,
@@ -1597,6 +1646,13 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     "success": True, "id": doc_id,
                     "number": orig.get("number"),
                     "message": f"Fattura #{orig.get('number')} è già finalizzata."
+                }, ensure_ascii=False))]
+
+            errors, warnings = validation.validate(validation.normalize_stored_document(orig))
+            if errors:
+                return [TextContent(type="text", text=json.dumps({
+                    "success": False,
+                    "error": validation.format_block(errors, warnings, "finalizzazione"),
                 }, ensure_ascii=False))]
 
             items_list = []

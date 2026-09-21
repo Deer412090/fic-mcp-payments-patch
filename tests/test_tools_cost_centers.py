@@ -164,3 +164,11 @@ def test_revenue_center_validation_against_revenue_list_only(server_module):
     assert good_payload["success"] is True
     assert bad_payload["success"] is False
     assert "CostOnly" in bad_payload["error"]
+
+
+@pytest.fixture(autouse=True)
+def _skip_fiscal_validation(server_module):
+    """Questi test verificano i centri di ricavo con fatture generiche (IVA 22%),
+    non le regole fiscali di Vasario: il controllo fiscale ha i suoi test."""
+    with patch.object(server_module.validation, "validate", return_value=([], [])):
+        yield

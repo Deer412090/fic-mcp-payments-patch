@@ -405,3 +405,11 @@ def test_list_received_documents_includes_cost_center(server_module):
     docs = json.loads(result[0].text)
     assert docs[0]["cost_center"] == "Project Alpha"
     assert "cost_center" not in docs[1]
+
+
+@pytest.fixture(autouse=True)
+def _skip_fiscal_validation(server_module):
+    """Questi test verificano i centri di ricavo con fatture generiche (IVA 22%),
+    non le regole fiscali di Vasario: il controllo fiscale ha i suoi test."""
+    with patch.object(server_module.validation, "validate", return_value=([], [])):
+        yield
