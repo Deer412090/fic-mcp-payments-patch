@@ -322,8 +322,11 @@ def build_issued_document(doc_type, client_id, items_data, date_str, payment_day
         body_data["ei_data"] = {"payment_method": "MP05"}
     elif doc_type in ("invoice", "credit_note") and not electronic:
         body_data["e_invoice"] = False
-        # Fatture serie F = pazienti privati → obbligo invio Sistema Tessera Sanitaria
-        body_data["ts_communication"] = True
+        # Il flag Sistema TS NON viene impostato: vive in extra_data.ts_communication
+        # (con ts_tipo_spesa e ts_pagamento_tracciato), non alla radice del documento.
+        # Scritto qui alla radice veniva scartato in silenzio: tutte le fatture serie F
+        # create da questo server risultano "Fattura non STS" (accertato 21/09/2026).
+        # Attivarlo è una decisione fiscale aperta con il commercialista.
     if source_invoice_id:
         body_data["original_document"] = {"id": source_invoice_id}
     if disable_cassa:
@@ -1447,7 +1450,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             ei_status = d.get("ei_status")
             status_map = {
                 None: "Bozza (non inviata)", "not_sent": "Bozza (non inviata)",
-                "pending": "In attesa di invio", "sent": "Inviata, in attesa di risposta SDI",
+                "pending": "In attesa di invio",
+                # In FIC questo stato compare come "Inviata" con spunta verde: è lo stato
+                # normale dopo la trasmissione, non un invio rimasto in sospeso.
+                "sent": "Inviata allo SdI (in FIC: 'Inviata')",
                 "delivered": "Consegnata al destinatario", "accepted": "Accettata",
                 "rejected": "Rifiutata", "not_delivered": "Non consegnata (messa a disposizione)"
             }
