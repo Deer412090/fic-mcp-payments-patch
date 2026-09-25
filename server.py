@@ -743,6 +743,38 @@ async def list_tools():
             annotations=_ann(idempotent=True),
         ),
         Tool(
+            name="mark_for_ts",
+            description=(
+                "MARCA una fattura a paziente (serie F, non elettronica) per il Sistema Tessera "
+                "Sanitaria, scrivendo in extra_data: ts_communication=True, ts_tipo_spesa, "
+                "ts_pagamento_tracciato. NON trasmette nulla al Sistema TS: marcare e inviare sono "
+                "operazioni distinte, e l'invio oggi lo cura lo studio del commercialista. "
+                "Rifiuta: fatture elettroniche (B2B), documenti gia' trasmessi al TS (ts_sent_date "
+                "presente), tipi diversi da fattura. Dopo la scrittura RILEGGE il documento salvato "
+                "e dichiara successo solo se i campi risultano davvero scritti e gli importi invariati. "
+                "Usare prima dry_run=true e mostrare a Gabriele il riepilogo. IMPORTANTE: chiedere "
+                "conferma all'utente prima di eseguire senza dry_run."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "document_id": {"type": "integer", "description": "ID documento FIC"},
+                    "pagamento_tracciato": {
+                        "type": "boolean",
+                        "description": "True se il paziente ha pagato con mezzo tracciato (bonifico, carta, POS, pagamento tramite clinica); False se in contanti. Obbligatorio: non si deduce."
+                    },
+                    "tipo_spesa": {
+                        "type": "string",
+                        "enum": ["SR", "SP", "AA"],
+                        "description": "Codice tipo spesa TS. Default SR: comprende visite specialistiche e prestazioni chirurgiche non estetiche (Allegato A disciplinare tecnico TS)."
+                    },
+                    "dry_run": {"type": "boolean", "description": "Se true mostra stato attuale e modifica prevista senza scrivere. Default false."}
+                },
+                "required": ["document_id", "pagamento_tracciato"]
+            },
+            annotations=_ann(idempotent=True),
+        ),
+        Tool(
             name="list_cost_centers",
             description="Lista combinata di centri di costo e ricavo configurati in FattureInCloud. L'API FIC espone due liste separate (cost_centers per documenti ricevuti, revenue_centers per documenti emessi); questo tool ne ritorna l'unione deduplicata e ordinata, coerente con la vista 'Analisi centri c/r' della UI FIC. Le validation interne dei tool di mutazione sono type-specific: create_invoice/credit_note/proforma/update_document/duplicate_invoice/convert_proforma_to_invoice validano `revenue_center` contro la sola lista revenue_centers; create_received_document valida `cost_center` contro la sola lista cost_centers. Read-only.",
             inputSchema={"type": "object", "properties": {}},
@@ -1883,6 +1915,101 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 result["payment_account_id"] = payment_account_id
             result["ei_status"] = orig.get("ei_status")
             return [TextContent(type="text", text=json.dumps(result, indent=2, ensure_ascii=False))]
+
+        elif name == "mark_for_ts":
+            # Marca per il Sistema TS. NON trasmette: l'invio lo cura lo studio del
+            # commercialista (decisione 24/09/2026). Nato dal difetto del 21/09/2026:
+            # ts_communication veniva scritto alla radice e l'SDK lo scartava in
+            # silenzio. Per questo qui il successo si dichiara solo dopo aver
+            # RILETTO il documento salvato.
+            doc_id = arguments["document_id"]
+            tracciato = arguments["pagamento_tracciato"]
+            tipo_spesa = arguments.get("tipo_spesa") or "SR"
+            dry_run = bool(arguments.get("dry_run", False))
+            if not isinstance(tracciato, bool):
+                return [TextContent(type="text", text=json.dumps({
+                    "success": False, "error": "pagamento_tracciato_mancante",
+                    "message": "pagamento_tracciato deve essere true o false: non si deduce."
+                }, indent=2, ensure_ascii=False))]
+
+            def _leggi():
+                r = issued_api.get_issued_document(
+                    company_id=COMPANY_ID, document_id=doc_id, fieldset="detailed")
+                return r.data.to_dict()
+
+            prima = _leggi()
+            ed_prima = prima.get("extra_data") or {}
+            tipo_doc = str(prima.get("type", "")).replace("IssuedDocumentType.", "").lower()
+            base = {
+                "document_id": doc_id,
+                "number": prima.get("number"),
+                "numeration": prima.get("numeration"),
+                "date": str(prima.get("date") or "")[:10],
+                "client": (prima.get("entity") or {}).get("name", ""),
+                "amount_gross": prima.get("amount_gross"),
+            }
+
+            blocco = None
+            if tipo_doc != "invoice":
+                blocco = f"tipo documento '{tipo_doc}': si marcano solo le fatture."
+            elif prima.get("e_invoice"):
+                blocco = "fattura elettronica (B2B): non va al Sistema TS."
+            elif ed_prima.get("ts_sent_date") or ed_prima.get("ts_file_id"):
+                blocco = (f"documento gia' trasmesso al Sistema TS "
+                          f"(ts_sent_date={ed_prima.get('ts_sent_date')}): non si modifica.")
+            if blocco:
+                return [TextContent(type="text", text=json.dumps({
+                    **base, "success": False, "error": "bloccato", "message": blocco,
+                    "extra_data_attuale": ed_prima,
+                }, indent=2, ensure_ascii=False, default=str))]
+
+            nuovi = {
+                "ts_communication": True,
+                "ts_tipo_spesa": tipo_spesa,
+                "ts_pagamento_tracciato": tracciato,
+            }
+            prima_ts = {k: ed_prima.get(k) for k in nuovi}
+            if dry_run:
+                return [TextContent(type="text", text=json.dumps({
+                    **base, "success": True, "dry_run": True,
+                    "attuale": prima_ts, "previsto": nuovi,
+                    "gia_corretto": prima_ts == nuovi,
+                    "message": "Nessuna scrittura. Confermare con Gabriele prima di eseguire.",
+                }, indent=2, ensure_ascii=False, default=str))]
+
+            # PUT parziale: FIC fonde il corpo col documento salvato (verificato
+            # 02/09/2026 su mark_as_paid). Si preserva ts_opposizione se presente.
+            corpo_ed = dict(nuovi)
+            if ed_prima.get("ts_opposizione") is not None:
+                corpo_ed["ts_opposizione"] = ed_prima.get("ts_opposizione")
+            issued_api.modify_issued_document(
+                company_id=COMPANY_ID, document_id=doc_id,
+                modify_issued_document_request={"data": {"extra_data": corpo_ed}}
+            )
+
+            # Rilettura: la prova e' il documento salvato, non la chiamata.
+            dopo = _leggi()
+            ed_dopo = dopo.get("extra_data") or {}
+            dopo_ts = {k: ed_dopo.get(k) for k in nuovi}
+            importi = ("amount_net", "amount_gross", "amount_withholding_tax", "stamp_duty")
+            importi_cambiati = {k: [prima.get(k), dopo.get(k)] for k in importi
+                                if prima.get(k) != dopo.get(k)}
+            altri_cambiati = {k: [ed_prima.get(k), ed_dopo.get(k)]
+                              for k in set(ed_prima) | set(ed_dopo)
+                              if k not in nuovi and ed_prima.get(k) != ed_dopo.get(k)}
+            ok = dopo_ts == nuovi and not importi_cambiati
+            result = {
+                **base,
+                "success": ok,
+                "salvato": dopo_ts,
+                "atteso": nuovi,
+                "importi_cambiati": importi_cambiati,
+                "altri_campi_extra_data_cambiati": altri_cambiati,
+                "message": ("Marcata per il Sistema TS (NON trasmessa). Verificato rileggendo il documento."
+                            if ok else
+                            "ATTENZIONE: il documento riletto non corrisponde a quanto scritto. Non considerarla marcata."),
+            }
+            return [TextContent(type="text", text=json.dumps(result, indent=2, ensure_ascii=False, default=str))]
 
         elif name == "list_cost_centers":
             cost = fetch_cost_centers(company_id=COMPANY_ID)
