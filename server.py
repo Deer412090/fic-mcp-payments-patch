@@ -1923,7 +1923,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             # silenzio. Per questo qui il successo si dichiara solo dopo aver
             # RILETTO il documento salvato.
             doc_id = arguments["document_id"]
-            tracciato = arguments["pagamento_tracciato"]
+            tracciato = arguments.get("pagamento_tracciato")
             tipo_spesa = arguments.get("tipo_spesa") or "SR"
             dry_run = bool(arguments.get("dry_run", False))
             if not isinstance(tracciato, bool):
@@ -1991,9 +1991,24 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             dopo = _leggi()
             ed_dopo = dopo.get("extra_data") or {}
             dopo_ts = {k: ed_dopo.get(k) for k in nuovi}
-            importi = ("amount_net", "amount_gross", "amount_withholding_tax", "stamp_duty")
-            importi_cambiati = {k: [prima.get(k), dopo.get(k)] for k in importi
-                                if prima.get(k) != dopo.get(k)}
+            # Confronto sugli importi REALI del documento. Gli amount_* calcolati
+            # arrivano null in questa lettura (verificato 25/09/2026 su F4): un
+            # confronto su quelli passerebbe sempre. Si confrontano quindi righe,
+            # scadenze e bollo, che la lettura restituisce davvero.
+            def _impronta(d):
+                righe = [(i.get("qty"), i.get("net_price"), i.get("gross_price"),
+                          (i.get("vat") or {}).get("id") if isinstance(i.get("vat"), dict) else i.get("vat"))
+                         for i in (d.get("items_list") or [])]
+                scadenze = [(p.get("amount"), str(p.get("status")), str(p.get("paid_date")))
+                            for p in (d.get("payments_list") or [])]
+                return {"righe": righe, "scadenze": scadenze,
+                        "stamp_duty": d.get("stamp_duty"),
+                        "withholding_tax": d.get("withholding_tax")}
+            imp_prima, imp_dopo = _impronta(prima), _impronta(dopo)
+            importi_cambiati = {k: [imp_prima[k], imp_dopo[k]] for k in imp_prima
+                                if imp_prima[k] != imp_dopo[k]}
+            if not imp_prima["righe"]:
+                importi_cambiati["_controllo_non_eseguibile"] = "nessuna riga letta: impossibile verificare gli importi"
             altri_cambiati = {k: [ed_prima.get(k), ed_dopo.get(k)]
                               for k in set(ed_prima) | set(ed_dopo)
                               if k not in nuovi and ed_prima.get(k) != ed_dopo.get(k)}
