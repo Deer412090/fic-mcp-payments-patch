@@ -47,6 +47,28 @@ def errors_of(d, **kw):
     return v.validate(d, **kw)[0]
 
 
+
+# --- E.C.A.S. Fornaca: stessa P.IVA di Cellini (confermato da Fornaca il 28/09/2026) ---
+ECAS_PIVA = "10982360967"
+ECAS_CF = "01737940013"
+
+
+def test_ecas_piva_is_known_and_shared_with_cellini():
+    # Non è un errore di anagrafica: la P.IVA di ECAS è quella di Cellini, il CF è diverso.
+    assert ECAS_PIVA == CELLINI
+    assert v.CLIENT_RULES[ECAS_PIVA]["withholding_on_bollo"] is False
+    assert v.CLIENT_RULES[ECAS_CF]["withholding_on_bollo"] is False
+
+
+@pytest.mark.parametrize("imponibile,net", [
+    (516.53, 415.22),    # FE181 Fornaca pazienti esterni agosto
+    (1968.53, 1576.82),  # FE182 Fornaca pazienti esterni aprile
+    (1720.50, 1378.40),  # FE183 Fornaca pazienti esterni maggio
+])
+def test_ecas_formula_a_passes(imponibile, net):
+    assert errors_of(doc(ECAS_PIVA, [prest(imponibile), bollo(21)], net)) == []
+
+
 # --- fatture corrette già trasmesse: devono passare ---------------------------
 
 @pytest.mark.parametrize("imponibile,net", [

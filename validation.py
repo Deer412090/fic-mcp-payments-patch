@@ -12,10 +12,16 @@ TOLERANCE = 0.011
 
 # P.IVA → regole cliente. Cellini compare anche col CF perché il vecchio client FIC
 # era stato creato con P.IVA = CF (corretto il 09/07/2026).
+#
+# ⚠️ E.C.A.S. (Fornaca) ha la STESSA P.IVA di Cellini: 10982360967 (gruppo Humanitas).
+# Il suo CF è 01737940013, codice SDI MZO2A0U. Confermato per iscritto da Fornaca
+# (email Servetti M., 28/09/2026). Il client FIC 110786534 è giusto così: NON è un
+# errore e non va "corretto" né segnalato. Le regole fiscali coincidono con Cellini
+# (bollo art.15, ritenuta solo sull'imponibile), quindi la chiave condivisa è innocua.
 CLIENT_RULES = {
-    "10982360967": {"name": "Cellini", "bollo_vat_id": 21, "withholding_on_bollo": False},
+    "10982360967": {"name": "Cellini / Fornaca-ECAS", "bollo_vat_id": 21, "withholding_on_bollo": False},
     "00510380017": {"name": "Cellini", "bollo_vat_id": 21, "withholding_on_bollo": False},
-    "01737940013": {"name": "Fornaca/ECAS", "bollo_vat_id": 21, "withholding_on_bollo": False},
+    "01737940013": {"name": "Fornaca/ECAS (CF)", "bollo_vat_id": 21, "withholding_on_bollo": False},
     "09647040014": {"name": "Fisio&Lab", "bollo_vat_id": 21, "withholding_on_bollo": False},
     # CDC: confermato per iscritto il 07/07/2026 (bollo stesso codice N.4 della prestazione).
     # 03954980011 è il CF, che le Regole riportavano per errore nella colonna P.IVA.
