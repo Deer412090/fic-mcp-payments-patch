@@ -65,6 +65,21 @@ def get_total_from_doc(d):
     return sum((i.get('qty', 0) * i.get('gross_price', 0)) for i in items)
 
 
+def list_all_pages(list_fn, **kwargs):
+    """Chiama un endpoint di lista FIC e segue la paginazione fino all'ultima pagina.
+
+    Una chiamata sola restituisce al massimo per_page elementi (100): oltre
+    quella soglia i documenti restanti sparivano in silenzio dai totali.
+    """
+    response = list_fn(**kwargs)
+    items = list(response.data or [])
+    total_pages = getattr(response, 'last_page', 1) or 1
+    for page in range(2, total_pages + 1):
+        page_resp = list_fn(**kwargs, page=page)
+        items.extend(page_resp.data or [])
+    return items
+
+
 def get_client_by_id(client_id, *, company_id=None):
     if company_id is None:
         company_id = COMPANY_ID
@@ -688,12 +703,13 @@ async def list_tools():
         ),
         Tool(
             name="get_situation",
-            description="Dashboard anno: fatturato netto (fatture - NDC), incassato, da incassare, costi, margine. Supporta filtro per cliente.",
+            description="Dashboard anno: fatturato netto (fatture - NDC), incassato, da incassare, costi, margine. Supporta filtro per cliente. prossime_scadenze riporta le prime 10 rate non pagate; con all_unpaid=true l'elenco completo (numero_non_pagate dice quante sono).",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "year": {"type": "integer", "description": "Anno (default: corrente)"},
-                    "client_name": {"type": "string", "description": "Filtro per nome cliente (opzionale, ricerca parziale)"}
+                    "client_name": {"type": "string", "description": "Filtro per nome cliente (opzionale, ricerca parziale)"},
+                    "all_unpaid": {"type": "boolean", "description": "Se true, prossime_scadenze contiene tutte le rate non pagate invece delle prime 10 (default: false)"}
                 }
             },
             annotations=_ann(read_only=True, idempotent=True),
@@ -829,11 +845,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 last_day = 31 if month in [1,3,5,7,8,10,12] else 30 if month in [4,6,9,11] else 29
                 q = f"date >= '{year}-{month:02d}-01' and date <= '{year}-{month:02d}-{last_day}'"
 
-            response = issued_api.list_issued_documents(
+            docs = list_all_pages(
+                issued_api.list_issued_documents,
                 company_id=COMPANY_ID, type=doc_type, q=q, per_page=100, fieldset="detailed"
             )
             invoices = []
-            for doc in (response.data or []):
+            for doc in docs:
                 d = doc.to_dict()
                 inv = {
                     "id": d.get("id"),
@@ -921,9 +938,11 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
         elif name == "list_clients":
             query = arguments.get("query")
-            response = clients_api.list_clients(company_id=COMPANY_ID, per_page=100)
+            all_clients = list_all_pages(
+                clients_api.list_clients, company_id=COMPANY_ID, per_page=100
+            )
             clients = []
-            for c in (response.data or []):
+            for c in all_clients:
                 cd = c.to_dict()
                 client = {"id": cd.get("id"), "name": cd.get("name"),
                           "vat": cd.get("vat_number"), "tax_code": cd.get("tax_code"),
@@ -1595,11 +1614,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             if month:
                 last_day = 31 if month in [1,3,5,7,8,10,12] else 30 if month in [4,6,9,11] else 29
                 q = f"date >= '{year}-{month:02d}-01' and date <= '{year}-{month:02d}-{last_day}'"
-            response = received_api.list_received_documents(
+            received = list_all_pages(
+                received_api.list_received_documents,
                 company_id=COMPANY_ID, type=doc_type, q=q, per_page=100, fieldset="detailed"
             )
             docs = []
-            for doc in (response.data or []):
+            for doc in received:
                 d = doc.to_dict()
                 supplier_name = d.get('entity', {}).get('name', '') if d.get('entity') else ''
                 desc = d.get('description', '') or ''
@@ -1618,23 +1638,28 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         elif name == "get_situation":
             year = arguments.get("year", datetime.now().year)
             client_filter = (arguments.get("client_name") or "").lower().strip()
+            all_unpaid = bool(arguments.get("all_unpaid", False))
             q = f"date >= '{year}-01-01' and date <= '{year}-12-31'"
 
-            emesse_resp = issued_api.list_issued_documents(
+            emesse = list_all_pages(
+                issued_api.list_issued_documents,
                 company_id=COMPANY_ID, type="invoice", q=q, per_page=100, fieldset="detailed"
             )
-            ndc_resp = issued_api.list_issued_documents(
+            ndc = list_all_pages(
+                issued_api.list_issued_documents,
                 company_id=COMPANY_ID, type="credit_note", q=q, per_page=100, fieldset="detailed"
             )
 
             totale_fatturato = totale_incassato = totale_ndc = 0
+            numero_fatture = numero_ndc = 0
             fatture_non_pagate = []
 
-            for doc in (emesse_resp.data or []):
+            for doc in emesse:
                 d = doc.to_dict()
                 client_name = d.get('entity', {}).get('name', '') if d.get('entity') else ''
                 if client_filter and client_filter not in client_name.lower():
                     continue
+                numero_fatture += 1
                 totale_fatturato += get_total_from_doc(d)
                 for p in d.get('payments_list', []):
                     status = str(p.get('status', '')).replace('IssuedDocumentStatus.', '').upper()
@@ -1648,29 +1673,33 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                             "due_date": str(p.get('due_date', ''))
                         })
 
-            for doc in (ndc_resp.data or []):
+            for doc in ndc:
                 d = doc.to_dict()
                 client_name = d.get('entity', {}).get('name', '') if d.get('entity') else ''
                 if client_filter and client_filter not in client_name.lower():
                     continue
+                numero_ndc += 1
                 totale_ndc += abs(get_total_from_doc(d))
 
             fatturato_netto = totale_fatturato - totale_ndc
 
             totale_costi = 0
             if not client_filter:
-                ricevute_resp = received_api.list_received_documents(
+                ricevute = list_all_pages(
+                    received_api.list_received_documents,
                     company_id=COMPANY_ID, type="expense", q=q, per_page=100, fieldset="detailed"
                 )
                 totale_costi = sum(
                     d.to_dict().get('amount_gross') or d.to_dict().get('amount_net') or 0
-                    for d in (ricevute_resp.data or [])
+                    for d in ricevute
                 )
 
             fatture_non_pagate.sort(key=lambda x: x.get('due_date', ''))
             result = {
                 "anno": year,
                 "filtro_cliente": client_filter or None,
+                "numero_fatture": numero_fatture,
+                "numero_note_credito": numero_ndc,
                 "fatturato_lordo": round(totale_fatturato, 2),
                 "note_credito": round(totale_ndc, 2),
                 "fatturato_netto": round(fatturato_netto, 2),
@@ -1678,7 +1707,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 "da_incassare": round(fatturato_netto - totale_incassato, 2),
                 "costi_totali": round(totale_costi, 2) if not client_filter else "N/A (filtro cliente attivo)",
                 "margine_lordo": round(fatturato_netto - totale_costi, 2) if not client_filter else "N/A",
-                "prossime_scadenze": fatture_non_pagate[:10]
+                "numero_non_pagate": len(fatture_non_pagate),
+                "prossime_scadenze": fatture_non_pagate if all_unpaid else fatture_non_pagate[:10]
             }
             return [TextContent(type="text", text=json.dumps(result, indent=2, ensure_ascii=False))]
 
