@@ -25,8 +25,9 @@ CLIENT_RULES = {
     "09647040014": {"name": "Fisio&Lab", "bollo_vat_id": 21, "withholding_on_bollo": False},
     # CDC: confermato per iscritto il 07/07/2026 (bollo stesso codice N.4 della prestazione).
     # 03954980011 è il CF, che le Regole riportavano per errore nella colonna P.IVA.
-    "13661780968": {"name": "CDC", "bollo_vat_id": 45, "withholding_on_bollo": True},
-    "03954980011": {"name": "CDC", "bollo_vat_id": 45, "withholding_on_bollo": True},
+    # requires_po: Affidea (23/10/2026) vuole il numero PO nel blocco DatiOrdineAcquisto dell'XML.
+    "13661780968": {"name": "CDC", "bollo_vat_id": 45, "withholding_on_bollo": True, "requires_po": True},
+    "03954980011": {"name": "CDC", "bollo_vat_id": 45, "withholding_on_bollo": True, "requires_po": True},
     "03966780011": {"name": "Cidimu", "bollo_vat_id": 19, "withholding_on_bollo": True},
 }
 
@@ -96,7 +97,19 @@ def normalize_stored_document(d):
         # (fatture pazienti dal form): l'effetto reale lo misura già il netto.
         "cassa": None,
         "numeration": d.get("numeration"),
+        "po_number": _po_number(d.get("ei_data")),
     }
+
+
+def _po_number(ei_data):
+    """Numero d'ordine dal blocco ei_data, solo se il documento d'origine è un ordine d'acquisto."""
+    if not ei_data:
+        return None
+    if hasattr(ei_data, "to_dict"):
+        ei_data = ei_data.to_dict()
+    if _enum_str(ei_data.get("original_document_type")) != "ordine":
+        return None
+    return (ei_data.get("od_number") or "").strip() or None
 
 
 def expected_net(items, withholding, withholding_on_bollo):
@@ -179,6 +192,12 @@ def validate(doc, *, source=None):
             )
         if imponibile <= BOLLO_THRESHOLD and bollo_items:
             errors.append(f"Marca da bollo su imponibile €{imponibile:.2f} ≤ €77,47: non dovuta.")
+
+    if doc_type == "invoice" and rules and rules.get("requires_po") and not doc.get("po_number"):
+        errors.append(
+            f"Manca il numero PO per {rules['name']}: va passato po_number (e po_date), che lo scrive nel "
+            "blocco DatiOrdineAcquisto dell'XML. Nella sola descrizione non basta (Affidea, 23/10/2026)."
+        )
 
     if is_b2b and rules is None:
         warnings.append(

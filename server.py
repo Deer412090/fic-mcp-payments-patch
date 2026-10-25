@@ -236,7 +236,7 @@ def build_issued_document(doc_type, client_id, items_data, date_str, payment_day
                           visible_subject, negate_prices=False, source_invoice_id=None,
                           revenue_center=None, disable_cassa=False, disable_withholding_tax=False,
                           electronic=True, withholding_rate_pct=20.0, withholding_on_bollo=False,
-                          number=None, numeration=None):
+                          number=None, numeration=None, po_number=None, po_date=None):
     client_data = get_client_by_id(client_id)
     if not client_data:
         return None, f"Cliente con ID {client_id} non trovato"
@@ -301,6 +301,7 @@ def build_issued_document(doc_type, client_id, items_data, date_str, payment_day
             "cassa": None if disable_cassa else "default FIC",
             "at_creation": True,
             "numeration": numeration,
+            "po_number": (po_number or "").strip() or None,
         }
         errors, validation_warnings = validation.validate(check, source=source)
         if errors:
@@ -335,6 +336,13 @@ def build_issued_document(doc_type, client_id, items_data, date_str, payment_day
     if doc_type in ("invoice", "credit_note") and electronic:
         body_data["e_invoice"] = True
         body_data["ei_data"] = {"payment_method": "MP05"}
+        # Numero PO nel blocco DatiOrdineAcquisto dell'XML (richiesto da Affidea/CDC il 23/10/2026:
+        # nella sola descrizione non basta, serve all'abbinamento automatico nei loro gestionali).
+        if po_number:
+            body_data["ei_data"]["original_document_type"] = "ordine"
+            body_data["ei_data"]["od_number"] = str(po_number).strip()
+            if po_date:
+                body_data["ei_data"]["od_date"] = po_date
     elif doc_type in ("invoice", "credit_note") and not electronic:
         body_data["e_invoice"] = False
         # Il flag Sistema TS NON viene impostato: vive in extra_data.ts_communication
@@ -520,7 +528,9 @@ async def list_tools():
                     "finalize": {"type": "boolean", "description": "Finalizza subito (locked=True, non modificabile). True per pazienti privati. Default: false."},
                     "withholding_on_bollo": {"type": "boolean", "description": "Applica ritenuta anche sulla marca da bollo (default: false). True solo se il cliente lo richiede esplicitamente."},
                     "number": {"type": "integer", "description": "Numero fattura (opzionale). Usare solo per la PRIMA fattura di un nuovo sezionale, es. 137 per avviare la serie FE da FE137/2026."},
-                    "numeration": {"type": "string", "description": "Sezionale (opzionale). Es. 'FE' per fatture elettroniche B2B. Dopo la prima, FIC auto-incrementa."}
+                    "numeration": {"type": "string", "description": "Sezionale (opzionale). Es. 'FE' per fatture elettroniche B2B. Dopo la prima, FIC auto-incrementa."},
+                    "po_number": {"type": "string", "description": "Numero dell'ordine d'acquisto (PO/Notula) da scrivere nel blocco DatiOrdineAcquisto dell'XML. OBBLIGATORIO per CDC/Affidea (es. '4500246765')."},
+                    "po_date": {"type": "string", "description": "Data del PO, YYYY-MM-DD (dal PDF del PO). Consigliata insieme a po_number."}
                 },
                 "required": ["client_id", "items"]
             },
@@ -915,6 +925,11 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             }
             if d.get("rc_center"):
                 result["revenue_center"] = d["rc_center"]
+            po = validation._po_number(d.get("ei_data"))
+            if po:
+                ei = d.get("ei_data") or {}
+                result["po_number"] = po
+                result["po_date"] = str(ei.get("od_date") or "") or None
             return [TextContent(type="text", text=json.dumps(result, indent=2, ensure_ascii=False))]
 
         elif name == "get_pdf_url":
@@ -1035,6 +1050,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 withholding_on_bollo=arguments.get("withholding_on_bollo", False),
                 number=arguments.get("number"),
                 numeration=arguments.get("numeration"),
+                po_number=arguments.get("po_number"),
+                po_date=arguments.get("po_date"),
             )
             if error:
                 return [TextContent(type="text", text=json.dumps({"success": False, "error": error}, ensure_ascii=False))]
@@ -1365,6 +1382,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 "items": validation.normalize_items(items_list),
                 "payment_total": payment_amount,
                 "cassa": None,
+                "po_number": validation._po_number(orig.get("ei_data")),
             })
             if errors:
                 return [TextContent(type="text", text=json.dumps({

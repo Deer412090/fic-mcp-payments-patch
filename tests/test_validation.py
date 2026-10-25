@@ -88,7 +88,7 @@ def test_cellini_formula_a_passes(imponibile, net):
     (1585.75, 1270.20),  # FE168
 ])
 def test_cdc_formula_b_passes(imponibile, net):
-    assert errors_of(doc(CDC, [prest(imponibile), bollo(45)], net)) == []
+    assert errors_of(doc(CDC, [prest(imponibile), bollo(45)], net, po_number="4500246765")) == []
 
 
 def test_cidimu_ndc9_passes():
@@ -112,12 +112,12 @@ def test_fe177_missing_bollo_is_blocked():
 
 
 def test_cdc_with_formula_a_is_blocked():
-    errs = errors_of(doc(CDC, [prest(333.00), bollo(45)], 268.40))
+    errs = errors_of(doc(CDC, [prest(333.00), bollo(45)], 268.40, po_number="4500215567"))
     assert any("atteso €268.00" in e for e in errs)
 
 
 def test_cdc_bollo_art15_is_blocked():
-    errs = errors_of(doc(CDC, [prest(333.00), bollo(21)], 268.00))
+    errs = errors_of(doc(CDC, [prest(333.00), bollo(21)], 268.00, po_number="4500215567"))
     assert any("vat_id 21" in e and "45" in e for e in errs)
 
 
@@ -227,6 +227,34 @@ def test_stored_patient_invoice_with_document_cassa_field_passes():
     s = stored("", [prest(160), bollo(21)], 162.00, e_invoice=False)
     s["cassa"] = 2
     assert v.validate(v.normalize_stored_document(s))[0] == []
+
+
+# --- CDC/Affidea: numero PO nel blocco DatiOrdineAcquisto (indicazioni del 23/10/2026) ---
+
+def test_cdc_without_po_is_blocked():
+    # FE185 (settembre 2026): PO 4500246765 solo nella descrizione
+    errs = errors_of(doc(CDC, [prest(1296.75), bollo(45)], 1039.00))
+    assert any("Manca il numero PO" in e for e in errs)
+
+
+def test_cdc_credit_note_without_po_passes():
+    assert errors_of(doc(CDC, [prest(333.00), bollo(45)], 268.00, doc_type="credit_note")) == []
+
+
+def test_other_clients_do_not_need_po():
+    assert errors_of(doc(CIDIMU, [prest(510.30), bollo(19)], 409.84)) == []
+
+
+def test_stored_cdc_po_is_read_from_ei_data():
+    s = stored(CDC, [prest(1296.75), bollo(45)], 1039.00)
+    s["ei_data"] = {"original_document_type": "ordine", "od_number": "4500246765", "od_date": "2026-10-01"}
+    assert v.validate(v.normalize_stored_document(s))[0] == []
+
+
+def test_stored_cdc_with_po_only_in_description_is_blocked():
+    s = stored(CDC, [prest(1296.75), bollo(45)], 1039.00)
+    s["ei_data"] = {"payment_method": "MP05"}
+    assert any("Manca il numero PO" in e for e in v.validate(v.normalize_stored_document(s))[0])
 
 
 def test_stored_fe177_is_blocked():
@@ -368,3 +396,47 @@ def test_create_invoice_fe179_reaches_fic(server_module):
     assert out["success"] is True
     body = create.call_args.kwargs["create_issued_document_request"]["data"]
     assert body["payments_list"][0]["amount"] == 1391.01
+
+
+def _cdc_client():
+    client = MagicMock()
+    client.data.to_dict.return_value = {"id": 110786723, "name": "C.D.C. CENTRO POLISPECIALISTICO PRIVATO - S.R.L.",
+                                        "vat_number": CDC, "ei_code": "OJ0R3K5"}
+    return client
+
+
+CDC_ITEMS = [{"name": "Prestazioni mediche per vostro conto — settembre 2026", "qty": 1,
+              "net_price": 1296.75, "vat_id": 45},
+             {"name": "Marca da bollo", "qty": 1, "net_price": 2, "vat_id": 45}]
+
+
+def test_create_invoice_cdc_writes_po_in_xml_order_block(server_module):
+    s = server_module
+    created = MagicMock()
+    created.data.to_dict.return_value = {"id": 1, "number": 191, "date": "2026-10-25"}
+    with patch.object(s.clients_api, "get_client", return_value=_cdc_client()), \
+         patch.object(s.issued_api, "create_issued_document", return_value=created) as create:
+        out = json.loads(asyncio.run(s.call_tool("create_invoice", {
+            "client_id": 110786723, "electronic": True, "numeration": "FE", "disable_cassa": True,
+            "withholding_on_bollo": True, "items": CDC_ITEMS,
+            "po_number": "4500246765", "po_date": "2026-10-01",
+        }))[0].text)
+    assert out["success"] is True
+    ei = create.call_args.kwargs["create_issued_document_request"]["data"]["ei_data"]
+    assert ei["original_document_type"] == "ordine"
+    assert ei["od_number"] == "4500246765"
+    assert ei["od_date"] == "2026-10-01"
+    assert ei["payment_method"] == "MP05"
+
+
+def test_create_invoice_cdc_without_po_never_reaches_fic(server_module):
+    s = server_module
+    with patch.object(s.clients_api, "get_client", return_value=_cdc_client()), \
+         patch.object(s.issued_api, "create_issued_document") as create:
+        out = json.loads(asyncio.run(s.call_tool("create_invoice", {
+            "client_id": 110786723, "electronic": True, "numeration": "FE", "disable_cassa": True,
+            "withholding_on_bollo": True, "items": CDC_ITEMS,
+        }))[0].text)
+    assert out["success"] is False
+    assert "Manca il numero PO" in out["error"]
+    assert create.call_count == 0
