@@ -208,6 +208,75 @@ def build_entity_from_client(client_id, client_data=None):
     return entity
 
 
+ENTITY_FIELDS = ("name", "vat_number", "tax_code", "address_street", "address_city",
+                 "address_postal_code", "address_province", "country")
+
+
+def entity_from_document(doc_entity, client_id=None):
+    """Intestatario copiato da un documento salvato (NDC speculare, 17/11/2026).
+
+    Una NDC a storno deve riportare gli stessi dati della fattura che storna, anche se
+    nel frattempo l'anagrafica è cambiata (caso FE155-159 Cellini, vecchia P.IVA).
+    """
+    src = doc_entity.to_dict() if hasattr(doc_entity, "to_dict") else dict(doc_entity or {})
+    cid = src.get("id") or client_id
+    entity = {"id": cid}
+    for f in ENTITY_FIELDS:
+        v = src.get(f)
+        if v is not None:
+            entity[f] = v
+    entity.setdefault("country", "Italia")
+    ei_code = (src.get("ei_code") or "").strip()
+    entity["ei_code"] = ei_code or (get_ei_code_for_client(cid) if cid else "0000000")
+    pec = (src.get("certified_email") or "").strip()
+    if pec:
+        entity["certified_email"] = pec
+    return entity
+
+
+def get_client_fresh(client_id, *, company_id=None):
+    """Anagrafica letta da FIC senza passare dalla cache (per i controlli)."""
+    if company_id is None:
+        company_id = COMPANY_ID
+    try:
+        return clients_api.get_client(company_id=company_id, client_id=client_id).data.to_dict()
+    except Exception:
+        return None
+
+
+def verifica_intestatario_salvato(doc_id, riferimento, origine):
+    """Rilegge il documento salvato e confronta P.IVA e CF con `riferimento`.
+
+    Restituisce (dettaglio, avviso). L'avviso è None se coincidono.
+    """
+    try:
+        saved = issued_api.get_issued_document(
+            company_id=COMPANY_ID, document_id=doc_id, fieldset="detailed"
+        ).data.to_dict()
+    except Exception as e:
+        return ({"verificato": False, "errore": str(e)},
+                f"⚠️ Intestatario NON verificato: impossibile rileggere il documento salvato ({e}).")
+    ent = saved.get("entity") or {}
+    if hasattr(ent, "to_dict"):
+        ent = ent.to_dict()
+    if not riferimento:
+        return ({"verificato": False, "salvato": {k: ent.get(k) for k in ("vat_number", "tax_code")}},
+                f"⚠️ Intestatario NON verificato: {origine} non disponibile.")
+    diff = validation.confronta_intestatario(ent, riferimento)
+    dettaglio = {
+        "verificato": True,
+        "confrontato_con": origine,
+        "salvato": {k: ent.get(k) for k in ("vat_number", "tax_code")},
+        "atteso": {k: riferimento.get(k) for k in ("vat_number", "tax_code")},
+        "differenze": diff,
+    }
+    avviso = None
+    if diff:
+        avviso = ("⚠️ INTESTATARIO DIVERSO da " + origine + ": " + "; ".join(diff) +
+                  ". Non inviare: controllare l'anagrafica (cache cliente vecchia?) e correggere la bozza.")
+    return dettaglio, avviso
+
+
 def build_items_list(items_data, negate=False):
     items_list = []
     for item in items_data:
@@ -249,7 +318,25 @@ def build_issued_document(doc_type, client_id, items_data, date_str, payment_day
                 f"Disponibili: {known}. Crearli da web FIC (Impostazioni → Centri di costo/ricavo)."
             )
 
-    entity = build_entity_from_client(client_id, client_data)
+    # NDC a storno: intestatario copiato dalla fattura stornata, non dall'anagrafica attuale.
+    src_doc = None
+    if doc_type == "credit_note" and source_invoice_id:
+        try:
+            src_doc = issued_api.get_issued_document(
+                company_id=COMPANY_ID, document_id=source_invoice_id, fieldset="detailed"
+            ).data.to_dict()
+        except Exception as e:
+            return None, f"Impossibile leggere la fattura da stornare {source_invoice_id}: {e}"
+        src_ent = src_doc.get("entity") or {}
+        if hasattr(src_ent, "to_dict"):
+            src_ent = src_ent.to_dict()
+        src_cid = src_ent.get("id")
+        if src_cid and int(src_cid) != int(client_id):
+            return None, (f"La fattura {source_invoice_id} è intestata al cliente {src_cid} "
+                          f"({src_ent.get('name')}), non al cliente {client_id}: NDC non creata.")
+        entity = entity_from_document(src_ent, client_id)
+    else:
+        entity = build_entity_from_client(client_id, client_data)
     items_list = build_items_list(items_data, negate=False)
 
     invoice_date = datetime.strptime(date_str, "%Y-%m-%d")
@@ -282,15 +369,7 @@ def build_issued_document(doc_type, client_id, items_data, date_str, payment_day
 
     validation_warnings = []
     if doc_type in ("invoice", "credit_note"):
-        source = None
-        if doc_type == "credit_note" and source_invoice_id:
-            try:
-                src = issued_api.get_issued_document(
-                    company_id=COMPANY_ID, document_id=source_invoice_id, fieldset="detailed"
-                ).data.to_dict()
-                source = validation.normalize_stored_document(src)
-            except Exception as e:
-                return None, f"Impossibile leggere la fattura da stornare {source_invoice_id}: {e}"
+        source = validation.normalize_stored_document(src_doc) if src_doc else None
         check = {
             "type": doc_type,
             "e_invoice": electronic,
@@ -383,6 +462,15 @@ def build_issued_document(doc_type, client_id, items_data, date_str, payment_day
         result["linked_to_invoice"] = source_invoice_id
     if validation_warnings:
         result["validation_warnings"] = validation_warnings
+    if doc_type in ("invoice", "credit_note") and d.get("id"):
+        if src_doc is not None:
+            riferimento, origine = entity, f"fattura stornata {source_invoice_id} (NDC speculare)"
+        else:
+            riferimento, origine = get_client_fresh(client_id), "anagrafica FIC attuale (senza cache)"
+        dettaglio, avviso = verifica_intestatario_salvato(d["id"], riferimento, origine)
+        result["intestatario_check"] = dettaglio
+        if avviso:
+            result["intestatario_warning"] = avviso
     return result, None
 
 
@@ -1025,6 +1113,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 modify_client_request={"data": client_data}
             )
             d = response.data.to_dict()
+            # La cache cliente dura 24 ore: senza questa riga le fatture emesse subito dopo
+            # portavano ancora il dato vecchio (FE155-159, 09/07/2026).
+            cache.invalidate(f"client_{client_id}", COMPANY_ID)
             result = {
                 "success": True,
                 "id": d.get("id"),
@@ -1325,8 +1416,13 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             payment_amount = round(total_abs - withholding_amount, 2)
 
             client_id = orig.get("entity", {}).get("id")
-            client_data = get_client_by_id(client_id) if client_id else None
-            entity = build_entity_from_client(client_id, client_data) if (client_id and client_data) else orig.get("entity", {})
+            if is_credit_note:
+                # Una NDC tiene l'intestatario con cui è nata (speculare alla fattura stornata):
+                # ricostruirlo dall'anagrafica attuale la rovinerebbe (17/11/2026).
+                entity = entity_from_document(orig.get("entity", {}), client_id)
+            else:
+                client_data = get_client_by_id(client_id) if client_id else None
+                entity = build_entity_from_client(client_id, client_data) if (client_id and client_data) else orig.get("entity", {})
 
             if "revenue_center" in arguments:
                 revenue_center = arguments["revenue_center"]

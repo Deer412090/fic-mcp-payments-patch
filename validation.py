@@ -4,6 +4,8 @@ Fonte delle regole: Regole_fatturazione_Vasario.md e CLAUDE.md di progetto.
 Una regola nuova si aggiunge qui (con un test), non solo nelle guide.
 """
 
+import re
+
 BOLLO_AMOUNT = 2.0
 BOLLO_THRESHOLD = 77.47
 WITHHOLDING_RATE = 0.20
@@ -241,3 +243,33 @@ def format_block(errors, warnings, action):
         lines.append("Avvisi:")
         lines += [f"- {w}" for w in warnings]
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Controllo dell'intestatario sul documento SALVATO (17/11/2026).
+# FE155-159 (09/07) uscirono con la vecchia P.IVA Cellini 00510380017 perché la
+# cache cliente era vecchia; nessuno lo vide fino alla segnalazione di Cellini.
+# ---------------------------------------------------------------------------
+
+def _norm_id(value):
+    """P.IVA / codice fiscale confrontabili: maiuscolo, senza spazi né prefisso IT."""
+    v = re.sub(r"\s+", "", str(value or "")).upper()
+    if v.startswith("IT") and v[2:].isdigit():
+        v = v[2:]
+    return v
+
+
+def confronta_intestatario(salvato, riferimento):
+    """Differenze di P.IVA e codice fiscale tra l'intestatario salvato e quello atteso.
+
+    `riferimento` è l'anagrafica FIC attuale per una fattura, l'intestatario della
+    fattura stornata per una NDC speculare. Lista vuota = coincidono.
+    """
+    salvato = salvato or {}
+    riferimento = riferimento or {}
+    diff = []
+    for campo, etichetta in (("vat_number", "P.IVA"), ("tax_code", "codice fiscale")):
+        a, b = _norm_id(salvato.get(campo)), _norm_id(riferimento.get(campo))
+        if a != b:
+            diff.append(f"{etichetta}: salvata «{a or '—'}», attesa «{b or '—'}»")
+    return diff
