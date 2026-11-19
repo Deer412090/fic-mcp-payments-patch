@@ -104,3 +104,42 @@ def test_completa_ei_data_non_sovrascrive(server):
     assert out["bank_iban"] == IBAN and out["od_number"] == "PO1"
     keep = server.completa_ei_data({"payment_method": "MP08", "bank_iban": "ALTRO"})
     assert keep["payment_method"] == "MP08" and keep["bank_iban"] == "ALTRO"
+
+
+class FakeSend:
+    """Bozza FE senza IBAN: send_to_sdi deve aggiungerlo prima dell'invio."""
+
+    def __init__(self, accetta=True):
+        self.ei, self.accetta, self.inviata = {"payment_method": "MP05"}, accetta, False
+
+    def get_issued_document(self, company_id, document_id, fieldset=None):
+        return _resp({"id": document_id, "type": "invoice", "e_invoice": True, "number": 204,
+                      "ei_status": "not_sent", "entity": CLIENT, "ei_data": dict(self.ei)})
+
+    def modify_issued_document(self, company_id, document_id, modify_issued_document_request):
+        if self.accetta:
+            self.ei = modify_issued_document_request["data"]["ei_data"]
+
+
+def _send(server, fake):
+    import asyncio
+    einv = MagicMock()
+    einv.send_e_invoice.side_effect = lambda **kw: setattr(fake, "inviata", True)
+    with patch.object(server, "issued_api", fake), patch.object(server, "einvoice_api", einv), \
+         patch.object(server.validation, "validate", return_value=([], [])):
+        out = asyncio.run(server.call_tool("send_to_sdi", {"document_id": 568}))
+    return json.loads(out[0].text)
+
+
+def test_invio_aggiunge_iban_mancante(server):
+    fake = FakeSend()
+    res = _send(server, fake)
+    assert res["success"] is True and fake.inviata
+    assert fake.ei["bank_iban"] == IBAN and "aggiunto" in res["iban"]
+
+
+def test_invio_bloccato_se_iban_non_si_salva(server):
+    fake = FakeSend(accetta=False)
+    res = _send(server, fake)
+    assert res["success"] is False and "IBAN" in res["error"]
+    assert fake.inviata is False

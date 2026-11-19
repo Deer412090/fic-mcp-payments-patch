@@ -282,7 +282,8 @@ def verifica_intestatario_salvato(doc_id, riferimento, origine):
 # Fornaca (mail del 18/11/2026) chiede l'IBAN nella fattura elettronica: senza, la
 # liquidazione può ritardare. Vale per tutte le fatture elettroniche con bonifico (MP05).
 # I dati stanno in dati_bancari.json, accanto a server.py ed escluso da git (repo pubblico).
-DATI_BANCARI_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dati_bancari.json")
+DATI_BANCARI_PATH = os.environ.get("FIC_DATI_BANCARI") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "dati_bancari.json")
 CAMPI_BANCA = ("bank_iban", "bank_name", "bank_beneficiary")
 
 
@@ -761,7 +762,7 @@ async def list_tools():
         ),
         Tool(
             name="update_document",
-            description="Modifica parziale di un documento BOZZA (fattura, NDC, proforma). Passa solo i campi da aggiornare. Funziona solo su documenti non ancora inviati allo SDI. IMPORTANTE: Chiedere sempre conferma all'utente prima di eseguire.",
+            description="Modifica parziale di un documento BOZZA (fattura, NDC, proforma). Passa solo i campi da aggiornare. Funziona solo su documenti non ancora inviati allo SDI. Chiamata senza altri campi su una fattura elettronica, aggiunge l'IBAN dello studio se manca (risultato: iban_check). IMPORTANTE: Chiedere sempre conferma all'utente prima di eseguire.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -819,7 +820,7 @@ async def list_tools():
         ),
         Tool(
             name="send_to_sdi",
-            description="Invia fattura/NDC allo SDI. ATTENZIONE: Azione irreversibile! Chiedere SEMPRE conferma esplicita all'utente.",
+            description="Invia fattura/NDC allo SDI. ATTENZIONE: Azione irreversibile! Chiedere SEMPRE conferma esplicita all'utente. L'IBAN dello studio è gestito dal server: se una fattura elettronica ne è priva lo aggiunge da solo prima dell'invio e blocca se non riesce a verificarlo. Non serve chiederlo all'utente.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -1726,6 +1727,25 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     "success": False,
                     "error": validation.format_block(errors, warnings, "invio SdI"),
                 }, ensure_ascii=False))]
+            # IBAN (19/11/2026): una fattura elettronica non parte senza. Se la bozza ne è
+            # priva (creata prima della regola) lo aggiunge qui, poi rilegge il salvato.
+            iban_aggiunto = False
+            if check_data.get("type") == "invoice" and check_data.get("e_invoice") \
+                    and carica_dati_bancari().get("bank_iban"):
+                ei = check_data.get("ei_data") or {}
+                if hasattr(ei, "to_dict"):
+                    ei = ei.to_dict()
+                if not ei.get("bank_iban"):
+                    issued_api.modify_issued_document(
+                        company_id=COMPANY_ID, document_id=doc_id,
+                        modify_issued_document_request={"data": {"ei_data": completa_ei_data(ei, "invoice")}})
+                    iban_aggiunto = True
+                _, iban_avv = verifica_iban_salvato(doc_id)
+                if iban_avv:
+                    return [TextContent(type="text", text=json.dumps({
+                        "success": False,
+                        "error": "Invio SdI bloccato: " + iban_avv,
+                    }, ensure_ascii=False))]
             einvoice_api.send_e_invoice(
                 company_id=COMPANY_ID, document_id=doc_id,
                 send_e_invoice_request={"data": {"withholding_tax_causal": None}}
@@ -1736,6 +1756,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 "client": check_data.get("entity", {}).get("name"),
                 "message": f"Fattura #{check_data.get('number')} inviata allo SDI con successo!"
             }
+            if iban_aggiunto:
+                result["iban"] = "aggiunto prima dell'invio e riletto dal documento salvato"
             return [TextContent(type="text", text=json.dumps(result, indent=2, ensure_ascii=False))]
 
         elif name == "get_invoice_status":
