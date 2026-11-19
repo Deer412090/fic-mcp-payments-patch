@@ -10,6 +10,13 @@ BOLLO_AMOUNT = 2.0
 BOLLO_THRESHOLD = 77.47
 WITHHOLDING_RATE = 0.20
 BOLLO_VAT_ID_DEFAULT = 21  # art. 15 DPR 633/72
+
+# Prestazioni NON sanitarie (18/11/2026, caso Smith & Nephew: consulenza per un simposio,
+# IVA 22% + ritenuta 20%). Le prestazioni sanitarie restano esenti (art. 10 n.18); una riga con
+# IVA è ammessa solo se il nome la dichiara non sanitaria con una di queste parole, il cliente
+# è B2B con P.IVA e l'aliquota è 22%. Una parola nuova si aggiunge qui, con un test.
+NON_HEALTH_KEYWORDS = ("consulenza", "docenza", "relazione", "relatore", "advisory", "formazione")
+NON_HEALTH_VAT_RATE = 22.0
 TOLERANCE = 0.011
 
 # P.IVA → regole cliente. Cellini compare anche col CF perché il vecchio client FIC
@@ -31,6 +38,9 @@ CLIENT_RULES = {
     "13661780968": {"name": "CDC", "bollo_vat_id": 45, "withholding_on_bollo": True, "requires_po": True},
     "03954980011": {"name": "CDC", "bollo_vat_id": 45, "withholding_on_bollo": True, "requires_po": True},
     "03966780011": {"name": "Cidimu", "bollo_vat_id": 19, "withholding_on_bollo": True},
+    # Smith & Nephew S.r.l. (richiesta del cliente 10/11/2026): consulenza NON sanitaria, IVA 22%, ritenuta 20%
+    # sul solo imponibile, niente bollo. Codice destinatario MJEGRSK.
+    "00953780962": {"name": "Smith & Nephew", "bollo_vat_id": 21, "withholding_on_bollo": False},
 }
 
 BLOCKED_CLIENTS = {
@@ -114,13 +124,19 @@ def _po_number(ei_data):
     return (ei_data.get("od_number") or "").strip() or None
 
 
+def is_non_health(item):
+    name = (item.get("name") or "").lower()
+    return any(k in name for k in NON_HEALTH_KEYWORDS)
+
+
 def expected_net(items, withholding, withholding_on_bollo):
     imponibile = sum(i["qty"] * i["net_price"] for i in items if not is_bollo(i))
+    iva = sum(i["qty"] * i["net_price"] * i.get("vat_value", 0) / 100 for i in items if not is_bollo(i))
     bollo = sum(i["qty"] * i["net_price"] for i in items if is_bollo(i))
     if not withholding:
-        return round(imponibile + bollo, 2)
+        return round(imponibile + iva + bollo, 2)
     base = imponibile + (bollo if withholding_on_bollo else 0)
-    return round(imponibile + bollo - base * WITHHOLDING_RATE, 2)
+    return round(imponibile + iva + bollo - base * WITHHOLDING_RATE, 2)
 
 
 def validate(doc, *, source=None):
@@ -148,11 +164,23 @@ def validate(doc, *, source=None):
         return errors, warnings
 
     for i in items:
-        if i["vat_value"] != 0:
-            errors.append(
-                f"Riga '{i['name']}' con IVA {i['vat_value']:g}%: le prestazioni sanitarie sono esenti "
-                "(prestazione vat_id 45, art. 10 n. 18)."
-            )
+        if i["vat_value"] != 0 and not is_bollo(i):
+            if not is_b2b:
+                errors.append(
+                    f"Riga '{i['name']}' con IVA {i['vat_value']:g}% su cliente senza P.IVA: "
+                    "al paziente solo prestazioni sanitarie esenti (vat_id 45, art. 10 n. 18)."
+                )
+            elif not is_non_health(i):
+                errors.append(
+                    f"Riga '{i['name']}' con IVA {i['vat_value']:g}%: le prestazioni sanitarie sono esenti "
+                    "(prestazione vat_id 45, art. 10 n. 18). Una prestazione non sanitaria con IVA deve "
+                    f"dichiararlo nel nome ({', '.join(NON_HEALTH_KEYWORDS)})."
+                )
+            elif abs(i["vat_value"] - NON_HEALTH_VAT_RATE) > 0.001:
+                errors.append(
+                    f"Riga '{i['name']}': prestazione non sanitaria, aliquota attesa {NON_HEALTH_VAT_RATE:g}%, "
+                    f"trovata {i['vat_value']:g}%."
+                )
 
     cassa = doc.get("cassa")
     if cassa not in (None, 0, 0.0, "0"):
@@ -171,7 +199,8 @@ def validate(doc, *, source=None):
             errors.append('numeration="FE" su fattura non elettronica: la serie FE è solo per le fatture SdI.')
 
     bollo_items = [i for i in items if is_bollo(i)]
-    imponibile = sum(i["qty"] * i["net_price"] for i in items if not is_bollo(i))
+    # Il bollo si applica solo all'imponibile ESENTE: sulle righe con IVA non è dovuto.
+    imponibile = sum(i["qty"] * i["net_price"] for i in items if not is_bollo(i) and i["vat_value"] == 0)
 
     if len(bollo_items) > 1:
         errors.append("Più di una riga marca da bollo.")

@@ -353,11 +353,14 @@ def build_issued_document(doc_type, client_id, items_data, date_str, payment_day
     # Calcolo ritenuta e pagamento
     if not disable_withholding_tax and withholding_rate_pct > 0:
         # Base imponibile ritenuta: esclude bollo (art.15) salvo clienti che richiedono ritenuta anche sul bollo
+        # La ritenuta si calcola sull'IMPONIBILE, mai sull'IVA (prestazioni non sanitarie con IVA 22%,
+        # 18/11/2026: sul lordo con IVA sarebbe stata 107,36 invece di 88,00 su 440,00).
+        net_abs = sum(abs(i["qty"] * i["net_price"]) for i in items_list)
         if withholding_on_bollo:
-            withholding_base = total_abs
+            withholding_base = net_abs
         else:
             withholding_base = sum(
-                abs(i["qty"] * i["net_price"]) * (1 + i["vat"]["value"] / 100)
+                abs(i["qty"] * i["net_price"])
                 for i in items_list
                 if i["vat"].get("id") != BOLLO_VAT_ID
             )
@@ -401,7 +404,7 @@ def build_issued_document(doc_type, client_id, items_data, date_str, payment_day
     }
     # Imposta esplicitamente la base ritenuta in FIC (percentuale 0-100, NON valore assoluto)
     if withholding_base is not None:
-        body_data["withholding_tax_taxable"] = round(withholding_base / total_abs * 100, 4)
+        body_data["withholding_tax_taxable"] = round(withholding_base / net_abs * 100, 4)
         # Causale ritenuta obbligatoria per XML SdI: "A" = lavoro autonomo abituale
         if electronic:
             body_data["ei_withholding_tax_causal"] = "A"

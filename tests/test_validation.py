@@ -440,3 +440,77 @@ def test_create_invoice_cdc_without_po_never_reaches_fic(server_module):
     assert out["success"] is False
     assert "Manca il numero PO" in out["error"]
     assert create.call_count == 0
+
+
+# --- Prestazioni non sanitarie con IVA (18/11/2026, Smith & Nephew: consulenza simposio) ---
+SMITH = "00953780962"
+
+
+def consulenza(amount=440, vat=22):
+    return {"name": "Consulenza 2026 - Simposium on Regeneten, 6 November", "qty": 1,
+            "net_price": amount, "vat_id": 15691696, "vat_value": vat}
+
+
+def test_smith_consulenza_iva22_ritenuta_passes():
+    # 440 + IVA 96,80 - ritenuta 88 = 448,80
+    assert errors_of(doc(SMITH, [consulenza()], 448.80)) == []
+
+
+def test_non_health_vat_works_for_any_b2b_client():
+    assert errors_of(doc("01234567890", [consulenza(1000)], 1020.00)) == []
+
+
+def test_smith_consulenza_wrong_net_is_blocked():
+    errs = errors_of(doc(SMITH, [consulenza()], 536.80))
+    assert any("Netto da pagare" in e for e in errs)
+
+
+def test_consulenza_with_bollo_is_blocked():
+    errs = errors_of(doc(SMITH, [consulenza(), bollo(21)], 450.80))
+    assert any("bollo" in e.lower() for e in errs)
+
+
+def test_health_service_with_vat_is_still_blocked_on_b2b():
+    item = dict(prest(100), vat_id=15691696, vat_value=22)
+    errs = errors_of(doc(CELLINI, [item, bollo(21)], 124.00))
+    assert any("esenti" in e for e in errs)
+
+
+def test_consulenza_wrong_rate_is_blocked():
+    errs = errors_of(doc(SMITH, [consulenza(vat=10)], 444.00))
+    assert any("aliquota attesa" in e for e in errs)
+
+
+def test_consulenza_to_patient_is_blocked():
+    errs = errors_of(doc("", [consulenza(100), bollo(21)], 124.00, e_invoice=False))
+    assert any("senza P.IVA" in e for e in errs)
+
+
+def test_mixed_exempt_and_consulenza_needs_bollo_on_exempt_part_only():
+    exempt = prest(300)
+    # 300 esente + 100 consulenza: ritenuta su 400, IVA 22 sulla consulenza, bollo dovuto sull'esente
+    net = 300 + 100 + 22 + 2 - 400 * 0.2
+    assert errors_of(doc(SMITH, [exempt, consulenza(100), bollo(21)], net)) == []
+    errs = errors_of(doc(SMITH, [exempt, consulenza(100)], net - 2))
+    assert any("Manca la marca da bollo" in e for e in errs)
+
+
+def test_create_invoice_smith_consulenza_ritenuta_on_imponibile_not_on_vat(server_module):
+    """Consulenza 440 + IVA 22% (96,80) - ritenuta 20% su 440 (88,00) = 448,80; base ritenuta 100% dell'imponibile."""
+    s = server_module
+    client = MagicMock()
+    client.data.to_dict.return_value = {"id": 1, "name": "SMITH & NEPHEW S.r.l.",
+                                        "vat_number": SMITH, "ei_code": "MJEGRSK"}
+    created = MagicMock()
+    created.data.to_dict.return_value = {"id": 9, "number": 204, "date": "2026-11-19"}
+    with patch.object(s.clients_api, "get_client", return_value=client), \
+         patch.object(s.issued_api, "create_issued_document", return_value=created) as create:
+        out = json.loads(asyncio.run(s.call_tool("create_invoice", {
+            "client_id": 1, "electronic": True, "numeration": "FE", "disable_cassa": True,
+            "items": [{"name": "Consulenza 2026 - Simposium on Regeneten, 6 November", "qty": 1,
+                       "net_price": 440, "vat_id": 15691696, "vat_rate": 22}],
+        }))[0].text)
+    assert out["success"] is True
+    body = create.call_args.kwargs["create_issued_document_request"]["data"]
+    assert body["payments_list"][0]["amount"] == 448.80
+    assert body["withholding_tax_taxable"] == 100.0
