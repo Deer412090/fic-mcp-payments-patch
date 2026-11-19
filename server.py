@@ -1082,7 +1082,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 "items": items,
                 "payments": payments,
                 "ei_status": d.get("ei_status"),
-                "original_document": d.get("original_document")
+                "original_document": d.get("original_document"),
+                # IBAN nei dati di pagamento dell'XML (19/11/2026): per verificarlo dopo l'invio
+                "ei_bank_iban": (d.get("ei_data") or {}).get("bank_iban") if d.get("e_invoice") else None
             }
             if d.get("rc_center"):
                 result["revenue_center"] = d["rc_center"]
