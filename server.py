@@ -277,6 +277,70 @@ def verifica_intestatario_salvato(doc_id, riferimento, origine):
     return dettaglio, avviso
 
 
+
+# --- IBAN nelle fatture elettroniche (19/11/2026) -----------------------------
+# Fornaca (mail del 18/11/2026) chiede l'IBAN nella fattura elettronica: senza, la
+# liquidazione può ritardare. Vale per tutte le fatture elettroniche con bonifico (MP05).
+# I dati stanno in dati_bancari.json, accanto a server.py ed escluso da git (repo pubblico).
+DATI_BANCARI_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dati_bancari.json")
+CAMPI_BANCA = ("bank_iban", "bank_name", "bank_beneficiary")
+
+
+def carica_dati_bancari():
+    """Legge dati_bancari.json. Restituisce {} se manca o è illeggibile."""
+    try:
+        with open(DATI_BANCARI_PATH, encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception:
+        return {}
+    return {k: str(raw[k]).replace(" ", "") if k == "bank_iban" else str(raw[k])
+            for k in CAMPI_BANCA if raw.get(k)}
+
+
+def ei_data_base(doc_type="invoice"):
+    """ei_data di partenza: bonifico (MP05) e, per le fatture, l'IBAN dello studio.
+    Le note di credito restano senza IBAN: non sono pagamenti verso lo studio."""
+    data = {"payment_method": "MP05"}
+    if doc_type == "invoice":
+        data.update(carica_dati_bancari())
+    return data
+
+
+def completa_ei_data(ei_data, doc_type="invoice"):
+    """Aggiunge l'IBAN a un ei_data esistente che ne è privo (es. update_document
+    su una bozza creata prima del 19/11/2026). Non sovrascrive valori presenti."""
+    base = ei_data_base(doc_type)
+    out = dict(ei_data or {})
+    for k, v in base.items():
+        if not out.get(k):
+            out[k] = v
+    return out
+
+
+def verifica_iban_salvato(doc_id):
+    """Rilegge il documento salvato e controlla che l'IBAN atteso sia nell'ei_data.
+    Restituisce (dettaglio, avviso)."""
+    atteso = carica_dati_bancari().get("bank_iban")
+    if not atteso:
+        return ({"verificato": False},
+                "⚠️ IBAN non inserito: dati_bancari.json mancante o senza bank_iban.")
+    try:
+        saved = issued_api.get_issued_document(
+            company_id=COMPANY_ID, document_id=doc_id, fieldset="detailed"
+        ).data.to_dict()
+    except Exception as e:
+        return ({"verificato": False, "errore": str(e)},
+                f"⚠️ IBAN NON verificato: impossibile rileggere il documento salvato ({e}).")
+    ei = saved.get("ei_data") or {}
+    if hasattr(ei, "to_dict"):
+        ei = ei.to_dict()
+    salvato = (ei.get("bank_iban") or "").replace(" ", "")
+    dettaglio = {"verificato": True, "salvato": salvato or None, "atteso": atteso}
+    if salvato != atteso:
+        return dettaglio, f"⚠️ IBAN nella fattura elettronica diverso dall'atteso (salvato: {salvato or 'nessuno'})."
+    return dettaglio, None
+
+
 def build_items_list(items_data, negate=False):
     items_list = []
     for item in items_data:
@@ -417,7 +481,7 @@ def build_issued_document(doc_type, client_id, items_data, date_str, payment_day
         body_data["rc_center"] = revenue_center
     if doc_type in ("invoice", "credit_note") and electronic:
         body_data["e_invoice"] = True
-        body_data["ei_data"] = {"payment_method": "MP05"}
+        body_data["ei_data"] = ei_data_base(doc_type)
         # Numero PO nel blocco DatiOrdineAcquisto dell'XML (richiesto da Affidea/CDC il 23/10/2026:
         # nella sola descrizione non basta, serve all'abbinamento automatico nei loro gestionali).
         if po_number:
@@ -474,6 +538,11 @@ def build_issued_document(doc_type, client_id, items_data, date_str, payment_day
         result["intestatario_check"] = dettaglio
         if avviso:
             result["intestatario_warning"] = avviso
+        if doc_type == "invoice" and electronic:
+            iban_det, iban_avv = verifica_iban_salvato(d["id"])
+            result["iban_check"] = iban_det
+            if iban_avv:
+                result["iban_warning"] = iban_avv
     return result, None
 
 
@@ -1308,7 +1377,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             }
             if electronic:
                 body_data["e_invoice"] = True
-                body_data["ei_data"] = {"payment_method": "MP05"}
+                body_data["ei_data"] = ei_data_base(body_data.get("type", "invoice"))
             else:
                 body_data["e_invoice"] = False
             if revenue_center:
@@ -1460,7 +1529,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             if doc_type in ("invoice", "credit_note"):
                 body_data["e_invoice"] = was_electronic
                 if was_electronic:
-                    body_data["ei_data"] = orig.get("ei_data") or {"payment_method": "MP05"}
+                    body_data["ei_data"] = completa_ei_data(orig.get("ei_data"), doc_type)
             if orig.get("original_document"):
                 body_data["original_document"] = orig["original_document"]
             for field in ["cassa", "cassa_taxable"]:
@@ -1515,6 +1584,11 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 result["validation_warnings"] = warnings
             if revenue_center:
                 result["revenue_center"] = revenue_center
+            if doc_type == "invoice" and was_electronic:
+                iban_det, iban_avv = verifica_iban_salvato(doc_id)
+                result["iban_check"] = iban_det
+                if iban_avv:
+                    result["iban_warning"] = iban_avv
             return [TextContent(type="text", text=json.dumps(result, indent=2, ensure_ascii=False))]
 
         elif name == "duplicate_invoice":
@@ -1572,7 +1646,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     }, ensure_ascii=False))]
 
             body_data = {
-                "type": "invoice", "e_invoice": True, "ei_data": {"payment_method": "MP05"},
+                "type": "invoice", "e_invoice": True, "ei_data": ei_data_base("invoice"),
                 "entity": entity, "date": new_date_str, "visible_subject": visible_subject,
                 "items_list": items_list,
                 "payments_list": [{"amount": round(total_gross, 2),

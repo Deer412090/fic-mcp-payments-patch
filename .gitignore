@@ -44,3 +44,6 @@ MIGRAZIONE_CLAUDE_CODE.md
 # Modulo Fornaca MO.DG.68 vuoto: contiene la firma di Gab, non va su GitHub (repo pubblico).
 # Si rigenera con scripts/modg68/crea_template.py da un modulo compilato.
 scripts/modg68/template.pdf
+
+# Dati bancari dello studio (IBAN nelle fatture elettroniche): dato personale, repo pubblico.
+dati_bancari.json
